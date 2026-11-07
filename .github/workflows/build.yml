@@ -75,6 +75,55 @@ jobs:
         run: bash cpp/run_host_tests.sh
 
   # ---------------------------------------------------------------------------
+  # The offset tools' pure logic: pattern parsing, the wildcard scanner, the
+  # download-chain HTML parsing and the report shape. No APK and no .so are
+  # needed, so this is fast and always runs.
+  # ---------------------------------------------------------------------------
+  tools-tests:
+    name: Offset tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tool dependencies
+        run: pip install -r tools/requirements.txt
+
+      - name: Unit tests (pure logic)
+        run: python3 -m unittest discover -s tools/tests -v
+
+      - name: The tools parse and lint cleanly
+        run: |
+          python3 -m py_compile tools/download_and_extract.py tools/extract_offsets.py
+          python3 tools/download_and_extract.py --help >/dev/null
+          python3 tools/extract_offsets.py --help >/dev/null
+
+      - name: The committed offset maps parse and stay fail-closed
+        run: |
+          python3 - <<'EOF'
+          import json, glob, sys
+          checked = 0
+          for path in sorted(glob.glob("offsets/offsets_*.json")):
+              report = json.load(open(path))
+              # Every map must carry its build id and must not claim a
+              # fabricated entity seam.
+              assert report["so_sha256"], f"{path}: no build id"
+              seam = report["entity_seam_offsets"]
+              if not seam["resolved"]:
+                  for field in seam["fields"]:
+                      assert field["offset"] is None, f"{path}: unresolved seam has an offset"
+              # Every resolved RTTI slot must point into .text (non-zero).
+              for slot in report["rtti_slots"]:
+                  assert slot["function_vaddr"] != 0, f"{path}: zero address"
+              checked += 1
+          print(f"checked {checked} offset map(s)")
+          assert checked > 0, "no offset maps committed"
+          EOF
+
+  # ---------------------------------------------------------------------------
   # Cross-compile the mod for arm64-v8a and verify the artifact.
   # ---------------------------------------------------------------------------
   build-so:

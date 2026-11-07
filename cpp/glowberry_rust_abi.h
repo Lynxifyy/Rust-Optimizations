@@ -148,6 +148,30 @@ struct GbrMesh gbr_mesh_world_layers(const struct GbrBlockLayer *layers,
                                      uint32_t count, uint32_t width,
                                      uint32_t depth);
 
+// --- Per-build offset maps -------------------------------------------------
+
+struct GbrOffsetMap; // opaque
+
+// Parses an offset map from JSON. Returns null on a parse error or bad UTF-8.
+struct GbrOffsetMap *gbr_offsets_load(const uint8_t *json, size_t len);
+void gbr_offsets_free(struct GbrOffsetMap *map);
+
+// The function address of a resolved RTTI slot, or 0 when the map has none.
+uint64_t gbr_offsets_slot(const struct GbrOffsetMap *map, const uint8_t *type_name,
+                          size_t len, uint32_t slot);
+
+// 1 when the map describes the given libminecraftpe.so build id (hex sha256),
+// else 0. This is the fail-closed gate: a mismatched map must not be used.
+uint32_t gbr_offsets_verify_build(const struct GbrOffsetMap *map,
+                                  const uint8_t *sha256, size_t len);
+
+// 1 when the entity seam is fully recovered, else 0.
+uint32_t gbr_offsets_entity_seam_complete(const struct GbrOffsetMap *map);
+
+// Copies the map's version string into `out` (NUL-terminated, truncated to cap).
+// Returns the length written, excluding the NUL.
+size_t gbr_offsets_version(const struct GbrOffsetMap *map, uint8_t *out, size_t cap);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
