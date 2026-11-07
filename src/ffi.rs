@@ -20,6 +20,7 @@ use std::os::raw::c_int;
 use crate::math::{self, Aabb};
 use crate::mesher::{self, ChunkDims, Mesh, Vertex};
 use crate::parallel::{self, ChunkJob};
+use crate::pipeline::{MeshJob, MeshPipeline};
 use crate::ring::Ring;
 
 /// A 3-vector, layout-compatible with the C++ `GbrVec3`.
@@ -112,6 +113,194 @@ fn mesh_into_ffi(mesh: Mesh) -> GbrMesh {
         indices: ip,
         index_count: ic,
     }
+}
+
+/// One horizontal block layer, layout-compatible with the C++ `GbrBlockLayer`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GbrBlockLayer {
+    pub block: u8,
+    pub count: u32,
+}
+
+/// The pipeline counters, layout-compatible with the C++ `GbrPipelineStats`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GbrPipelineStats {
+    pub submitted: u64,
+    pub meshed: u64,
+    pub drained: u64,
+    pub dropped: u64,
+    pub rejected: u64,
+}
+
+/// The opaque pipeline handle.
+pub struct GbrPipeline {
+    inner: MeshPipeline,
+}
+
+/// Creates a meshing pipeline with `workers` worker threads.
+///
+/// `job_capacity` bounds not-yet-meshed jobs; `result_capacity` bounds finished
+/// meshes waiting to be drained. Returns null when `workers` or either capacity
+/// is zero. Free with [`gbr_pipeline_free`].
+#[no_mangle]
+pub extern "C" fn gbr_pipeline_new(
+    workers: u32,
+    job_capacity: u32,
+    result_capacity: u32,
+) -> *mut GbrPipeline {
+    if workers == 0 || job_capacity == 0 || result_capacity == 0 {
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(GbrPipeline {
+        inner: MeshPipeline::new(
+            workers as usize,
+            job_capacity as usize,
+            result_capacity as usize,
+        ),
+    }))
+}
+
+/// Stops and frees a pipeline. Null is accepted.
+///
+/// # Safety
+/// `pipeline` must come from [`gbr_pipeline_new`] and not be freed before.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_pipeline_free(pipeline: *mut GbrPipeline) {
+    if !pipeline.is_null() {
+        drop(Box::from_raw(pipeline));
+    }
+}
+
+/// Submits a chunk to be meshed. Returns 0 on success, 1 when the pipeline is
+/// full or stopped (a back-pressure signal), -1 on a null argument.
+///
+/// # Safety
+/// `pipeline` must be valid and `blocks` must point to `x * y * z` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_pipeline_submit(
+    pipeline: *mut GbrPipeline,
+    chunk_id: u64,
+    blocks: *const u8,
+    x: u32,
+    y: u32,
+    z: u32,
+) -> c_int {
+    if pipeline.is_null() || blocks.is_null() || x == 0 || y == 0 || z == 0 {
+        return -1;
+    }
+    let dims = ChunkDims::new(x as usize, y as usize, z as usize);
+    let slice = std::slice::from_raw_parts(blocks, dims.volume());
+    let job = MeshJob {
+        chunk_id,
+        blocks: slice.to_vec(),
+        dims,
+    };
+    if (*pipeline).inner.submit(job) {
+        0
+    } else {
+        1
+    }
+}
+
+/// Drains up to `max` finished meshes into `out_meshes`/`out_ids`.
+///
+/// Returns the number written (0 when nothing is ready), or -1 on a null
+/// argument. Each written mesh must be freed with [`gbr_mesh_free`].
+///
+/// # Safety
+/// `out_meshes` and `out_ids` must have room for `max` items.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_pipeline_drain(
+    pipeline: *mut GbrPipeline,
+    out_meshes: *mut GbrMesh,
+    out_ids: *mut u64,
+    max: u32,
+) -> c_int {
+    if pipeline.is_null() || out_meshes.is_null() || out_ids.is_null() {
+        return -1;
+    }
+    if max == 0 {
+        return 0;
+    }
+    let results = (*pipeline).inner.drain(max as usize);
+    let meshes = std::slice::from_raw_parts_mut(out_meshes, max as usize);
+    let ids = std::slice::from_raw_parts_mut(out_ids, max as usize);
+    let n = results.len();
+    for (i, result) in results.into_iter().enumerate() {
+        meshes[i] = mesh_into_ffi(result.mesh);
+        ids[i] = result.chunk_id;
+    }
+    n as c_int
+}
+
+/// Writes the pipeline counters to `*out`. Returns 0, or -1 on a null argument.
+///
+/// # Safety
+/// `pipeline` and `out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_pipeline_stats(
+    pipeline: *const GbrPipeline,
+    out: *mut GbrPipelineStats,
+) -> c_int {
+    if pipeline.is_null() || out.is_null() {
+        return -1;
+    }
+    let s = (*pipeline).inner.stats();
+    *out = GbrPipelineStats {
+        submitted: s.submitted,
+        meshed: s.meshed,
+        drained: s.drained,
+        dropped: s.dropped,
+        rejected: s.rejected,
+    };
+    0
+}
+
+/// The best-effort number of finished meshes waiting to be drained.
+///
+/// # Safety
+/// `pipeline` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_pipeline_pending(pipeline: *const GbrPipeline) -> usize {
+    if pipeline.is_null() {
+        return 0;
+    }
+    (*pipeline).inner.pending()
+}
+
+/// Meshes a layered world directly: a `width x depth` footprint of `layers`
+/// stacked bottom-up (the shape the client's `FlatWorldGenerator` produces).
+///
+/// Returns an owned mesh; free it with [`gbr_mesh_free`]. Returns an empty mesh
+/// on a null argument or an empty footprint.
+///
+/// # Safety
+/// `layers` must point to `count` valid layer structs.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_mesh_world_layers(
+    layers: *const GbrBlockLayer,
+    count: u32,
+    width: u32,
+    depth: u32,
+) -> GbrMesh {
+    if layers.is_null() || count == 0 || width == 0 || depth == 0 {
+        return GbrMesh::empty();
+    }
+    let layer_slice = std::slice::from_raw_parts(layers, count as usize);
+    let world = crate::world::LayeredWorld {
+        width,
+        depth,
+        layers: layer_slice
+            .iter()
+            .map(|l| crate::world::BlockLayer {
+                block: l.block,
+                count: l.count,
+            })
+            .collect(),
+    };
+    mesh_into_ffi(world.to_mesh())
 }
 
 /// The core version, packed as `0x00MMmmpp`.
@@ -557,6 +746,75 @@ mod tests {
                 "min.y = {}",
                 out.min.y
             );
+        }
+    }
+
+    #[test]
+    fn pipeline_submit_drain_round_trip() {
+        let dims = ChunkDims::new(4, 4, 4);
+        let blocks = vec![1u8; dims.volume()];
+        unsafe {
+            let p = gbr_pipeline_new(2, 16, 16);
+            assert!(!p.is_null());
+            assert_eq!(gbr_pipeline_submit(p, 11, blocks.as_ptr(), 4, 4, 4), 0);
+
+            let mut meshes: Vec<GbrMesh> = (0..8).map(|_| GbrMesh::empty()).collect();
+            let mut ids = vec![0u64; 8];
+            // Wait for the worker to finish.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut n = 0;
+            while n == 0 && std::time::Instant::now() < deadline {
+                n = gbr_pipeline_drain(p, meshes.as_mut_ptr(), ids.as_mut_ptr(), 8);
+                if n == 0 {
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!(n, 1);
+            assert_eq!(ids[0], 11);
+            assert_eq!(meshes[0].vertex_count, 24);
+            for m in meshes {
+                gbr_mesh_free(m);
+            }
+
+            let mut stats = GbrPipelineStats::default();
+            assert_eq!(gbr_pipeline_stats(p, &mut stats), 0);
+            assert_eq!(stats.submitted, 1);
+            assert_eq!(stats.meshed, 1);
+            assert_eq!(stats.drained, 1);
+
+            gbr_pipeline_free(p);
+        }
+    }
+
+    #[test]
+    fn pipeline_null_is_refused() {
+        unsafe {
+            assert!(gbr_pipeline_new(0, 8, 8).is_null());
+            assert!(gbr_pipeline_new(1, 0, 8).is_null());
+            gbr_pipeline_free(std::ptr::null_mut());
+            assert_eq!(gbr_pipeline_pending(std::ptr::null()), 0);
+            let mut stats = GbrPipelineStats::default();
+            assert_eq!(gbr_pipeline_stats(std::ptr::null(), &mut stats), -1);
+        }
+    }
+
+    #[test]
+    fn world_layers_ffi_meshes_a_slab() {
+        let layers = [
+            GbrBlockLayer { block: 1, count: 1 },
+            GbrBlockLayer { block: 2, count: 2 },
+        ];
+        unsafe {
+            let mesh = gbr_mesh_world_layers(layers.as_ptr(), 2, 8, 8);
+            // An 8x3x8 opaque box, but the side faces cannot merge across the
+            // material boundary at y=1, so each of the four sides is two quads:
+            // 4*2 + top + bottom = 10 quads = 40 vertices.
+            assert_eq!(mesh.vertex_count, 40);
+            gbr_mesh_free(mesh);
+            // Null is safe.
+            let empty = gbr_mesh_world_layers(std::ptr::null(), 0, 8, 8);
+            assert_eq!(empty.vertex_count, 0);
+            gbr_mesh_free(empty);
         }
     }
 

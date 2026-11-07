@@ -34,8 +34,43 @@ about them:
   the preloader's `AGENTS.md`. Instead the core allocates nothing per frame and
   reuses caller-owned buffers.
 
-What it *does* provide is real and testable: the four modules below, all
-host-tested, plus a load-time self-test inside the game process.
+What it *does* provide is real and testable: the modules below, all
+host-tested, plus an in-session work loop the mod runs inside the game process.
+
+## The in-session loop (Phase 2)
+
+`mod/GlowberryRustMod.cpp` does not just load the core; on `load` it starts the
+pipeline and runs a real workload through it:
+
+1. It takes the client's own world model - a footprint of **block layers**, the
+   shape `FlatWorldGenerator` builds (bedrock / dirt / grass) - and packs it into
+   a voxel volume.
+2. It splits that volume into chunks and **submits every chunk** to the pipeline,
+   which hands each to a Rust worker thread.
+3. Each worker greedy-meshes its chunk and pushes the finished mesh onto a
+   **lock-free ring**.
+4. The mod **drains** the ring, exactly as a render thread would once per frame,
+   and frees each mesh.
+
+It then logs the chunk count, the total quads, the wall-clock time and the
+pipeline counters (`submitted`/`meshed`/`drained`/`dropped`/`rejected`). The
+assertion is that **drained == submitted and dropped == 0**: the pipeline neither
+lost nor duplicated work. That log line is the proof the core does real work
+in-session, and it is exercised end to end on the host by
+`cpp/ffi_smoke_test.cpp`.
+
+The same loop is reachable from any native code: the pipeline handle is kept live
+for the session, and the whole `gbr_pipeline_*` surface is exported from the
+`.so`, so the client's own voxel work can submit chunks to the same workers.
+
+### What the loop is not
+
+It is not wired to the running game's chunk data. Bedrock's world is only
+reachable through the BerryAPI seam (`all_entities`, `get_block`), and those
+slots are still null because the offsets that would fill them have not been
+recovered - that is the disassembly job the next PR is for. Until then the loop
+meshes the client's own world model, which is the one place the client itself
+owns voxel-shaped data.
 
 ## Layout
 
@@ -46,6 +81,8 @@ src/
   mesher.rs     binary greedy meshing with baked ambient occlusion
   parallel.rs   a bounded scoped worker pool for off-thread meshing
   ring.rs       a bounded lock-free MPMC ring buffer
+  pipeline.rs   the work loop: submit -> worker -> ring -> drain
+  world.rs      a layered world description turned into a meshed volume
   ffi.rs        the frozen C ABI (gbr_*)
 cpp/
   glowberry_rust_abi.h    the ABI header, single source of truth for both sides
@@ -76,6 +113,13 @@ mod/
   the consumer (render thread); a full ring returns the value so the worker can
   drop or defer, rather than growing without bound and turning a frame hitch into
   an OOM kill.
+- **`pipeline`** - the loop the core exists for: a bounded pool of worker threads
+  that pull chunk jobs off a ring, mesh them, and push the finished meshes onto a
+  result ring the consumer drains per frame. A full result ring drops and counts
+  rather than blocking.
+- **`world`** - turns a footprint of block layers (the client's
+  `FlatWorldGenerator` shape) into a voxel volume, meshes it whole, or splits it
+  into chunks that feed the pipeline.
 
 ## Building
 

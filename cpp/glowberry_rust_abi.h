@@ -52,6 +52,22 @@ struct GbrMesh {
 };
 
 struct GbrRing; // opaque
+struct GbrPipeline; // opaque
+
+// One horizontal block layer, matching the client's FlatWorldGenerator model.
+struct GbrBlockLayer {
+  uint8_t block;
+  uint32_t count;
+};
+
+// Pipeline counters. All monotonic.
+struct GbrPipelineStats {
+  uint64_t submitted;
+  uint64_t meshed;
+  uint64_t drained;
+  uint64_t dropped;
+  uint64_t rejected;
+};
 
 // The core version, packed as 0x00MMmmpp.
 uint32_t gbr_version(void);
@@ -98,6 +114,39 @@ int gbr_resolve_movement(const struct GbrAabb *start, const struct GbrVec3 *delt
 // Returns the number of visible boxes, or 0 when any pointer is null.
 uint32_t gbr_frustum_cull(const float *mat, const struct GbrAabb *boxes,
                           uint8_t *out_visible, uint32_t count);
+
+// --- The meshing pipeline (ring + worker threads) --------------------------
+
+// Creates a pipeline with `workers` worker threads. `job_capacity` bounds
+// not-yet-meshed jobs; `result_capacity` bounds finished meshes waiting to be
+// drained. Returns null when `workers` or either capacity is zero.
+struct GbrPipeline *gbr_pipeline_new(uint32_t workers, uint32_t job_capacity,
+                                     uint32_t result_capacity);
+void gbr_pipeline_free(struct GbrPipeline *pipeline);
+
+// Submits a chunk to be meshed. Returns 0 on success, 1 when the pipeline is full
+// or stopped (back-pressure), -1 on a null argument.
+int gbr_pipeline_submit(struct GbrPipeline *pipeline, uint64_t chunk_id,
+                        const uint8_t *blocks, uint32_t x, uint32_t y, uint32_t z);
+
+// Drains up to `max` finished meshes. Returns the number written (0 when nothing
+// is ready), or -1 on a null argument. Free each mesh with gbr_mesh_free.
+int gbr_pipeline_drain(struct GbrPipeline *pipeline, struct GbrMesh *out_meshes,
+                       uint64_t *out_ids, uint32_t max);
+
+// Writes the pipeline counters to `*out`. Returns 0, or -1 on a null argument.
+int gbr_pipeline_stats(const struct GbrPipeline *pipeline,
+                       struct GbrPipelineStats *out);
+
+// The best-effort number of finished meshes waiting to be drained.
+size_t gbr_pipeline_pending(const struct GbrPipeline *pipeline);
+
+// Meshes a layered world directly: a `width x depth` footprint of `layers`
+// stacked bottom-up (the shape the client's FlatWorldGenerator produces). Returns
+// an owned mesh; free it with gbr_mesh_free.
+struct GbrMesh gbr_mesh_world_layers(const struct GbrBlockLayer *layers,
+                                     uint32_t count, uint32_t width,
+                                     uint32_t depth);
 
 #ifdef __cplusplus
 } // extern "C"
