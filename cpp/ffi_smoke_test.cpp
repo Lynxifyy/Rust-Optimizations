@@ -281,6 +281,7 @@ static void test_entity_walk() {
       "\"version\":\"26.60\","
       "\"so_sha256\":\"b6ffe00817117b03a518b4c9254dcbbb821ad53f276d179c67021226ca221a80\","
       "\"entity_seam_offsets\":{\"resolved\":true,\"fields\":["
+      "{\"name\":\"actorLevelOffset\",\"offset\":32},"
       "{\"name\":\"levelEntityListOffset\",\"offset\":992},"
       "{\"name\":\"entityPositionOffset\",\"offset\":560}"
       "]}"
@@ -293,7 +294,7 @@ static void test_entity_walk() {
   }
   CHECK_EQ(gbr_offsets_entity_walk_ready(map), 1u);
 
-  // Two actors, each with a Vec3 at +0x230.
+  // Two actors, each with a Vec3 at +0x230 and a Level* at +0x20.
   struct ActorStorage {
     std::uint8_t bytes[0x230 + 12];
   };
@@ -325,8 +326,12 @@ static void test_entity_walk() {
   auto *manager_ptr = reinterpret_cast<const std::uint8_t *>(&manager);
   std::memcpy(level.bytes + 0x3e0, &manager_ptr, 8);
 
+  // The local player is an Actor whose +0x20 points at the Level.
+  auto *level_ptr = reinterpret_cast<const std::uint8_t *>(&level);
+  std::memcpy(a0.bytes + 0x20, &level_ptr, 8);
+
   const std::uint8_t *actors[8] = {nullptr};
-  const int n = gbr_entity_walk(map, level.bytes, actors, 8);
+  const int n = gbr_entity_walk(map, a0.bytes, actors, 8);
   CHECK_EQ(n, 2);
   if (n == 2) {
     float position[3] = {0, 0, 0};
@@ -337,12 +342,15 @@ static void test_entity_walk() {
   }
 
   // Null arguments are refused.
-  CHECK_EQ(gbr_entity_walk(nullptr, level.bytes, actors, 8), -1);
+  CHECK_EQ(gbr_entity_walk(nullptr, a0.bytes, actors, 8), -1);
   CHECK_EQ(gbr_entity_walk(map, nullptr, actors, 8), -1);
   CHECK_EQ(gbr_entity_position(map, nullptr, nullptr), -1);
 
-  // A null Level pointer is refused, not dereferenced.
-  CHECK_EQ(gbr_entity_walk(map, nullptr, actors, 8), -1);
+  // A local player with a null Level pointer is refused, not dereferenced.
+  {
+    ActorStorage empty{};
+    CHECK_EQ(gbr_entity_walk(map, empty.bytes, actors, 8), 0);
+  }
 
   gbr_offsets_free(map);
 
@@ -354,7 +362,7 @@ static void test_entity_walk() {
   if (bare != nullptr) {
     CHECK_EQ(gbr_offsets_entity_walk_ready(bare), 0u);
     // The walk then returns 0 rather than touching memory.
-    CHECK_EQ(gbr_entity_walk(bare, level.bytes, actors, 8), 0);
+    CHECK_EQ(gbr_entity_walk(bare, a0.bytes, actors, 8), 0);
     gbr_offsets_free(bare);
   }
 }
