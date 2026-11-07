@@ -1,0 +1,602 @@
+//! The C ABI the preloader C++ shim links against.
+//!
+//! Rust and C++ do not share a stable ABI, so the C++ side never calls a Rust
+//! symbol by its mangled name. It calls these `extern "C"` functions, whose
+//! names and layouts are frozen. Everything here is `unsafe` at the boundary:
+//! the caller must pass valid pointers and free every mesh it receives with
+//! [`gbr_mesh_free`].
+//!
+//! Ownership rules, stated once:
+//! - A function that returns a [`GbrMesh`] transfers ownership of its vertex and
+//!   index buffers to the caller. The caller must call [`gbr_mesh_free`] exactly
+//!   once per mesh.
+//! - A ring is owned by the caller from [`gbr_ring_new`] until [`gbr_ring_free`].
+//!   A mesh popped from a ring is owned by the caller afterwards.
+//! - Every function tolerates a null pointer by returning a failure code rather
+//!   than dereferencing it.
+
+use std::os::raw::c_int;
+
+use crate::math::{self, Aabb};
+use crate::mesher::{self, ChunkDims, Mesh, Vertex};
+use crate::parallel::{self, ChunkJob};
+use crate::ring::Ring;
+
+/// A 3-vector, layout-compatible with the C++ `GbrVec3`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GbrVec3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// An axis-aligned box, layout-compatible with the C++ `GbrAabb`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GbrAabb {
+    pub min: GbrVec3,
+    pub max: GbrVec3,
+}
+
+/// One mesh vertex. Layout matches the C++ `GbrVertex` and the GL attribute
+/// layout: position (3xf32), normal (3xi8), uv (2xf32), ao (u8), tint (u8).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GbrVertex {
+    pub pos: [f32; 3],
+    pub normal: [i8; 3],
+    pub uv: [f32; 2],
+    pub ao: u8,
+    pub tint: u8,
+}
+
+/// A meshed chunk handed to C++. Free with [`gbr_mesh_free`].
+#[repr(C)]
+#[derive(Debug)]
+pub struct GbrMesh {
+    pub vertices: *mut GbrVertex,
+    pub vertex_count: usize,
+    pub indices: *mut u32,
+    pub index_count: usize,
+}
+
+impl GbrMesh {
+    const fn empty() -> Self {
+        Self {
+            vertices: std::ptr::null_mut(),
+            vertex_count: 0,
+            indices: std::ptr::null_mut(),
+            index_count: 0,
+        }
+    }
+}
+
+/// The opaque ring handle.
+pub struct GbrRing {
+    inner: Ring<MeshPayload>,
+}
+
+/// A mesh tagged with the chunk it came from.
+pub struct MeshPayload {
+    pub chunk_id: u64,
+    pub mesh: Mesh,
+}
+
+/// Moves a `Vec<T>` into a raw pointer + length, keeping the exact allocation.
+fn vec_into_raw<T>(v: Vec<T>) -> (*mut T, usize) {
+    let boxed = v.into_boxed_slice();
+    let len = boxed.len();
+    (Box::into_raw(boxed) as *mut T, len)
+}
+
+/// Reclaims a pointer produced by [`vec_into_raw`].
+///
+/// # Safety
+/// `ptr`/`len` must come from [`vec_into_raw`] and not have been freed already.
+unsafe fn raw_into_vec<T>(ptr: *mut T, len: usize) -> Vec<T> {
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)).into_vec()
+}
+
+/// Converts an owned [`Mesh`] into a [`GbrMesh`], transferring the buffers.
+fn mesh_into_ffi(mesh: Mesh) -> GbrMesh {
+    let Mesh { vertices, indices } = mesh;
+    let (vp, vc) = vec_into_raw(vertices);
+    let (ip, ic) = vec_into_raw(indices);
+    GbrMesh {
+        vertices: vp as *mut GbrVertex,
+        vertex_count: vc,
+        indices: ip,
+        index_count: ic,
+    }
+}
+
+/// The core version, packed as `0x00MMmmpp`.
+#[no_mangle]
+pub extern "C" fn gbr_version() -> u32 {
+    crate::version()
+}
+
+/// Meshes one chunk of `x * y * z` blocks (`blocks` in x-fastest order).
+///
+/// Returns an owned mesh; free it with [`gbr_mesh_free`]. Returns an empty mesh
+/// (null buffers) when `blocks` is null or a dimension is zero.
+///
+/// # Safety
+/// `blocks` must point to at least `x * y * z` readable bytes, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_mesh_blocks(blocks: *const u8, x: u32, y: u32, z: u32) -> GbrMesh {
+    if blocks.is_null() || x == 0 || y == 0 || z == 0 {
+        return GbrMesh::empty();
+    }
+    let dims = ChunkDims::new(x as usize, y as usize, z as usize);
+    let slice = std::slice::from_raw_parts(blocks, dims.volume());
+    mesh_into_ffi(mesher::mesh_chunk_blocks(slice, dims))
+}
+
+/// Frees a mesh produced by this module. Null is accepted and ignored.
+///
+/// # Safety
+/// The mesh must have been produced here and not freed before.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_mesh_free(mesh: GbrMesh) {
+    drop(raw_into_vec(
+        mesh.vertices as *mut Vertex,
+        mesh.vertex_count,
+    ));
+    drop(raw_into_vec(mesh.indices, mesh.index_count));
+}
+
+/// Meshes `count` chunks across `workers` threads.
+///
+/// `blocks[i]` points at chunk `i`'s blocks; `dims` holds three `u32` per chunk
+/// (`x, y, z`). `out` must point to `count` writable [`GbrMesh`] slots. Each
+/// written mesh must be freed with [`gbr_mesh_free`]. Returns 0 on success, -1 on
+/// a null argument.
+///
+/// # Safety
+/// All pointers must be valid for the stated counts.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_mesh_batch(
+    blocks: *const *const u8,
+    dims: *const u32,
+    count: u32,
+    workers: u32,
+    out: *mut GbrMesh,
+) -> c_int {
+    if blocks.is_null() || dims.is_null() || out.is_null() {
+        return -1;
+    }
+    if count == 0 {
+        return 0;
+    }
+    let count = count as usize;
+    let block_ptrs = std::slice::from_raw_parts(blocks, count);
+    let dim_slice = std::slice::from_raw_parts(dims, count * 3);
+
+    // Own the block buffers as slices for the duration of the call.
+    let mut owned: Vec<&[u8]> = Vec::with_capacity(count);
+    let mut chunk_dims = Vec::with_capacity(count);
+    for i in 0..count {
+        let d = ChunkDims::new(
+            dim_slice[i * 3] as usize,
+            dim_slice[i * 3 + 1] as usize,
+            dim_slice[i * 3 + 2] as usize,
+        );
+        if block_ptrs[i].is_null() || d.volume() == 0 {
+            return -1;
+        }
+        owned.push(std::slice::from_raw_parts(block_ptrs[i], d.volume()));
+        chunk_dims.push(d);
+    }
+
+    let jobs: Vec<ChunkJob> = owned
+        .iter()
+        .zip(chunk_dims.iter())
+        .map(|(b, d)| ChunkJob {
+            blocks: b,
+            dims: *d,
+        })
+        .collect();
+
+    let meshes = parallel::mesh_chunks_parallel(&jobs, workers as usize);
+    let out_slice = std::slice::from_raw_parts_mut(out, count);
+    for (slot, mesh) in out_slice.iter_mut().zip(meshes) {
+        *slot = mesh_into_ffi(mesh);
+    }
+    0
+}
+
+/// Creates a ring that holds up to `capacity` meshes (rounded up to a power of
+/// two). Returns null when `capacity` is 0. Free with [`gbr_ring_free`].
+#[no_mangle]
+pub extern "C" fn gbr_ring_new(capacity: u32) -> *mut GbrRing {
+    if capacity == 0 {
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(GbrRing {
+        inner: Ring::with_capacity(capacity as usize),
+    }))
+}
+
+/// Frees a ring. Null is accepted. Any meshes still in the ring are dropped.
+///
+/// # Safety
+/// `ring` must come from [`gbr_ring_new`] and not be freed before.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_ring_free(ring: *mut GbrRing) {
+    if !ring.is_null() {
+        drop(Box::from_raw(ring));
+    }
+}
+
+/// Meshes `blocks` and pushes the result onto the ring.
+///
+/// Returns 0 on success, 1 when the ring is full (the mesh is dropped, not
+/// leaked), -1 on a null argument.
+///
+/// # Safety
+/// `ring` must be valid and `blocks` must point to `x * y * z` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_ring_push_mesh(
+    ring: *mut GbrRing,
+    chunk_id: u64,
+    blocks: *const u8,
+    x: u32,
+    y: u32,
+    z: u32,
+) -> c_int {
+    if ring.is_null() || blocks.is_null() || x == 0 || y == 0 || z == 0 {
+        return -1;
+    }
+    let dims = ChunkDims::new(x as usize, y as usize, z as usize);
+    let slice = std::slice::from_raw_parts(blocks, dims.volume());
+    let mesh = mesher::mesh_chunk_blocks(slice, dims);
+    let payload = MeshPayload { chunk_id, mesh };
+    match (*ring).inner.push(payload) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Pops one mesh from the ring into `*out` and reports the chunk id.
+///
+/// Returns 0 when a mesh was written (free it with [`gbr_mesh_free`]), 1 when the
+/// ring is empty, -1 on a null argument. On success `*out_chunk_id` receives the
+/// chunk id and `*out` receives the mesh.
+///
+/// # Safety
+/// `ring`, `out`, and `out_chunk_id` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_ring_pop_mesh(
+    ring: *mut GbrRing,
+    out: *mut GbrMesh,
+    out_chunk_id: *mut u64,
+) -> c_int {
+    if ring.is_null() || out.is_null() || out_chunk_id.is_null() {
+        return -1;
+    }
+    match (*ring).inner.pop() {
+        Some(payload) => {
+            *out = mesh_into_ffi(payload.mesh);
+            *out_chunk_id = payload.chunk_id;
+            0
+        }
+        None => 1,
+    }
+}
+
+/// The best-effort number of meshes waiting in the ring.
+///
+/// # Safety
+/// `ring` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_ring_len(ring: *const GbrRing) -> usize {
+    if ring.is_null() {
+        return 0;
+    }
+    (*ring).inner.len()
+}
+
+fn to_aabb(b: &GbrAabb) -> Aabb {
+    Aabb::new(
+        math::Vec3::new(b.min.x, b.min.y, b.min.z),
+        math::Vec3::new(b.max.x, b.max.y, b.max.z),
+    )
+}
+
+/// Resolves a moving AABB against static solids, writing the final box to `*out`.
+///
+/// `flags` (optional) receives a bitmask: 1 = hit x, 2 = hit y, 4 = hit z,
+/// 8 = on ground. Returns 0 on success, -1 on a null required pointer.
+///
+/// # Safety
+/// `solids` must point to `count` valid boxes; `start`, `delta`, and `out` valid.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_resolve_movement(
+    start: *const GbrAabb,
+    delta: *const GbrVec3,
+    solids: *const GbrAabb,
+    count: u32,
+    out: *mut GbrAabb,
+    flags: *mut u32,
+) -> c_int {
+    if start.is_null() || delta.is_null() || out.is_null() {
+        return -1;
+    }
+    let start_aabb = to_aabb(&*start);
+    let d = math::Vec3::new((*delta).x, (*delta).y, (*delta).z);
+    let solids_v: Vec<Aabb> = if solids.is_null() || count == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(solids, count as usize)
+            .iter()
+            .map(to_aabb)
+            .collect()
+    };
+    let r = math::resolve_movement(start_aabb, d, &solids_v);
+    *out = GbrAabb {
+        min: GbrVec3 {
+            x: r.aabb.min.x,
+            y: r.aabb.min.y,
+            z: r.aabb.min.z,
+        },
+        max: GbrVec3 {
+            x: r.aabb.max.x,
+            y: r.aabb.max.y,
+            z: r.aabb.max.z,
+        },
+    };
+    if !flags.is_null() {
+        let mut f = 0u32;
+        if r.hit_x {
+            f |= 1;
+        }
+        if r.hit_y {
+            f |= 2;
+        }
+        if r.hit_z {
+            f |= 4;
+        }
+        if r.on_ground {
+            f |= 8;
+        }
+        *flags = f;
+    }
+    0
+}
+
+/// Frustum-culls `count` boxes against a column-major 4x4 view-projection matrix
+/// (`mat` holds 16 floats in the order `Mat4::from_cols_array` produces).
+///
+/// `out_visible[i]` is set to 1 or 0. Returns the number of visible boxes, or 0
+/// when any pointer is null.
+///
+/// # Safety
+/// `mat` must point to 16 floats; `boxes` and `out_visible` to `count` items.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_frustum_cull(
+    mat: *const f32,
+    boxes: *const GbrAabb,
+    out_visible: *mut u8,
+    count: u32,
+) -> u32 {
+    if mat.is_null() || boxes.is_null() || out_visible.is_null() || count == 0 {
+        return 0;
+    }
+    let arr = *(mat as *const [f32; 16]);
+    let m = glam::Mat4::from_cols_array(&arr);
+    let frustum = math::Frustum::from_view_projection(m);
+    let boxes = std::slice::from_raw_parts(boxes, count as usize);
+    let out = std::slice::from_raw_parts_mut(out_visible, count as usize);
+    let mut visible = 0u32;
+    for (b, o) in boxes.iter().zip(out.iter_mut()) {
+        let aabb = to_aabb(b);
+        let v = frustum.contains_aabb(&aabb);
+        *o = v as u8;
+        if v {
+            visible += 1;
+        }
+    }
+    visible
+}
+
+#[cfg(test)]
+mod tests {
+    // Index expressions like `x + X * (y + Y * z)` spell out the x-fastest block
+    // layout on purpose; clippy reads the constant factors as no-ops.
+    #![allow(clippy::identity_op, clippy::erasing_op)]
+
+    use super::*;
+
+    #[test]
+    fn version_matches_core() {
+        assert_eq!(gbr_version(), crate::version());
+    }
+
+    #[test]
+    fn mesh_blocks_round_trips_and_frees() {
+        let dims = ChunkDims::new(4, 4, 4);
+        let mut blocks = vec![0u8; dims.volume()];
+        blocks[1 + 4 * (1 + 4 * 1)] = 1;
+        unsafe {
+            let mesh = gbr_mesh_blocks(blocks.as_ptr(), 4, 4, 4);
+            assert_eq!(mesh.vertex_count, 24);
+            assert_eq!(mesh.index_count, 36);
+            assert!(!mesh.vertices.is_null());
+            gbr_mesh_free(mesh);
+        }
+    }
+
+    #[test]
+    fn mesh_blocks_null_is_empty() {
+        unsafe {
+            let mesh = gbr_mesh_blocks(std::ptr::null(), 4, 4, 4);
+            assert_eq!(mesh.vertex_count, 0);
+            assert!(mesh.vertices.is_null());
+            gbr_mesh_free(mesh);
+        }
+    }
+
+    #[test]
+    fn mesh_batch_parallel_and_free() {
+        let dims = ChunkDims::cube_16();
+        let buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![1u8; dims.volume()]).collect();
+        let ptrs: Vec<*const u8> = buffers.iter().map(|b| b.as_ptr()).collect();
+        let dims_flat: Vec<u32> = vec![16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16];
+        let mut out: Vec<GbrMesh> = (0..4).map(|_| GbrMesh::empty()).collect();
+        unsafe {
+            let rc = gbr_mesh_batch(ptrs.as_ptr(), dims_flat.as_ptr(), 4, 4, out.as_mut_ptr());
+            assert_eq!(rc, 0);
+            for m in out {
+                assert_eq!(m.vertex_count, 24);
+                gbr_mesh_free(m);
+            }
+        }
+    }
+
+    #[test]
+    fn ring_push_pop_round_trip() {
+        let dims = ChunkDims::new(4, 4, 4);
+        let mut blocks = vec![0u8; dims.volume()];
+        blocks[1 + 4 * (1 + 4 * 1)] = 1;
+        unsafe {
+            let ring = gbr_ring_new(8);
+            assert!(!ring.is_null());
+            assert_eq!(gbr_ring_push_mesh(ring, 42, blocks.as_ptr(), 4, 4, 4), 0);
+            assert_eq!(gbr_ring_len(ring), 1);
+
+            let mut mesh = GbrMesh::empty();
+            let mut id = 0u64;
+            assert_eq!(gbr_ring_pop_mesh(ring, &mut mesh, &mut id), 0);
+            assert_eq!(id, 42);
+            assert_eq!(mesh.vertex_count, 24);
+            gbr_mesh_free(mesh);
+
+            // Empty now: a second pop must report empty, not hand back a stale mesh.
+            let mut empty = GbrMesh::empty();
+            assert_eq!(gbr_ring_pop_mesh(ring, &mut empty, &mut id), 1);
+            gbr_ring_free(ring);
+        }
+    }
+
+    #[test]
+    fn ring_full_returns_one_not_leak() {
+        let dims = ChunkDims::new(2, 2, 2);
+        let blocks = vec![1u8; dims.volume()];
+        unsafe {
+            // Capacity 1 rounds up to 2 (a single slot cannot work), so two fit.
+            let ring = gbr_ring_new(1);
+            assert_eq!(gbr_ring_push_mesh(ring, 1, blocks.as_ptr(), 2, 2, 2), 0);
+            assert_eq!(gbr_ring_push_mesh(ring, 2, blocks.as_ptr(), 2, 2, 2), 0);
+            assert_eq!(gbr_ring_push_mesh(ring, 3, blocks.as_ptr(), 2, 2, 2), 1);
+            let mut mesh = GbrMesh::empty();
+            let mut id = 0u64;
+            assert_eq!(gbr_ring_pop_mesh(ring, &mut mesh, &mut id), 0);
+            assert_eq!(id, 1);
+            gbr_mesh_free(mesh);
+            gbr_ring_free(ring);
+        }
+    }
+
+    #[test]
+    fn null_arguments_are_refused() {
+        unsafe {
+            assert!(gbr_ring_new(0).is_null());
+            assert_eq!(gbr_ring_len(std::ptr::null()), 0);
+            gbr_ring_free(std::ptr::null_mut());
+            assert_eq!(
+                gbr_ring_push_mesh(std::ptr::null_mut(), 0, std::ptr::null(), 1, 1, 1),
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_movement_ffi_reports_flags() {
+        let start = GbrAabb {
+            min: GbrVec3 {
+                x: -0.5,
+                y: 4.5,
+                z: -0.5,
+            },
+            max: GbrVec3 {
+                x: 0.5,
+                y: 5.5,
+                z: 0.5,
+            },
+        };
+        let delta = GbrVec3 {
+            x: 0.0,
+            y: -10.0,
+            z: 0.0,
+        };
+        let floor = GbrAabb {
+            min: GbrVec3 {
+                x: -10.0,
+                y: -1.0,
+                z: -10.0,
+            },
+            max: GbrVec3 {
+                x: 10.0,
+                y: 0.0,
+                z: 10.0,
+            },
+        };
+        let mut out = GbrAabb::default();
+        let mut flags = 0u32;
+        unsafe {
+            let rc = gbr_resolve_movement(&start, &delta, &floor, 1, &mut out, &mut flags);
+            assert_eq!(rc, 0);
+            assert_eq!(flags & 8, 8, "on_ground should be set");
+            assert!(
+                out.min.y >= 0.0 && out.min.y < 1e-3,
+                "min.y = {}",
+                out.min.y
+            );
+        }
+    }
+
+    #[test]
+    fn frustum_cull_ffi() {
+        let proj = glam::Mat4::perspective_rh_gl(90f32.to_radians(), 1.0, 0.1, 100.0);
+        let view = glam::Mat4::look_at_rh(glam::Vec3::ZERO, -glam::Vec3::Z, glam::Vec3::Y);
+        let m = (proj * view).to_cols_array();
+        let boxes = [
+            GbrAabb {
+                min: GbrVec3 {
+                    x: -0.5,
+                    y: -0.5,
+                    z: -10.5,
+                },
+                max: GbrVec3 {
+                    x: 0.5,
+                    y: 0.5,
+                    z: -9.5,
+                },
+            },
+            GbrAabb {
+                min: GbrVec3 {
+                    x: -0.5,
+                    y: -0.5,
+                    z: 9.5,
+                },
+                max: GbrVec3 {
+                    x: 0.5,
+                    y: 0.5,
+                    z: 10.5,
+                },
+            },
+        ];
+        let mut vis = [0u8; 2];
+        unsafe {
+            let n = gbr_frustum_cull(m.as_ptr(), boxes.as_ptr(), vis.as_mut_ptr(), 2);
+            assert_eq!(n, 1);
+            assert_eq!(vis[0], 1);
+            assert_eq!(vis[1], 0);
+        }
+    }
+}

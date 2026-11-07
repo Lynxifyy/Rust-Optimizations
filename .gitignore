@@ -1,0 +1,13 @@
+# Rust build output
+/target
+
+# CMake build tree and the CI-cloned preloader headers
+/build
+/third_party
+
+# Local editor/OS noise
+.DS_Store
+*.swp
+
+# Agent scratch (memory, local notes)
+.openhands/

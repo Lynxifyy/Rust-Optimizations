@@ -1,0 +1,37 @@
+[package]
+name = "glowberry_rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+authors = ["Lynxifyy <297587416+Lynxifyy@users.noreply.github.com>"]
+description = "Native acceleration core for GlowberryClient: SIMD math, binary greedy meshing, and a lock-free MPSC ring buffer."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "glowberry_rust"
+# cdylib: the host FFI smoke test links it directly.
+# staticlib: the C++ mod .so links it in, so the shipped artifact is one .so
+# that exports both the gbr_* core and the preloader's PLGetModRegistration.
+# rlib: normal Rust consumers and the unit tests.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+glam = "0.29"
+
+[features]
+default = []
+# Per-ABI SIMD gates. arm64-v8a always has NEON; x86_64 uses SSE2/AVX2. The
+# crate compiles without any of them (glam falls back to scalar).
+neon = []
+sse = []
+avx2 = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# The library is loaded into the game process; unwinding a panic across the C
+# ABI boundary is undefined, so abort instead.
+panic = "abort"
+strip = "debuginfo"
