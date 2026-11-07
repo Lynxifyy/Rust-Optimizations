@@ -112,9 +112,17 @@ jobs:
               # fabricated entity seam.
               assert report["so_sha256"], f"{path}: no build id"
               seam = report["entity_seam_offsets"]
-              if not seam["resolved"]:
-                  for field in seam["fields"]:
-                      assert field["offset"] is None, f"{path}: unresolved seam has an offset"
+              verified = {v["name"]: v["verified"]
+                          for v in report.get("entity_seam_verification", [])}
+              # A field may carry an offset only when the verifier proved it;
+              # otherwise it must be null (never guessed).
+              for field in seam["fields"]:
+                  proven = any(v and field["name"].endswith(k)
+                               for k, v in [("PositionOffset", verified.get("actor_position")),
+                                            ("RotationOffset", verified.get("actor_rotation"))])
+                  if not proven:
+                      assert field["offset"] is None, \
+                          f"{path}: {field['name']} has an offset but is not verified"
               # Every resolved RTTI slot must point into .text (non-zero).
               for slot in report["rtti_slots"]:
                   assert slot["function_vaddr"] != 0, f"{path}: zero address"

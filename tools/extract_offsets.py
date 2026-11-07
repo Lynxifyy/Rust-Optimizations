@@ -510,6 +510,133 @@ def scan_signature(image: ElfImage, name: str, pattern: str, description: str) -
 
 
 # ---------------------------------------------------------------------------
+# Entity-seam offset verification (deterministic, per build)
+# ---------------------------------------------------------------------------
+
+# The offsets the preloader hardcodes for the local-player feed. Recovering a
+# brand-new offset needs judgement, but *verifying* a known one is deterministic:
+# a struct field of a Vec3 is a member-address getter and a float-vector access
+# group at the same displacement. Checking that per build is what turns "the
+# preloader assumes 0x230" into "0x230 is still correct on this build".
+#
+# `Actor::mPos` and the view rotation are the two the feed reads.
+KNOWN_ENTITY_OFFSETS: list[tuple[str, int, str]] = [
+    ("actor_position", 0x230, "Vec3 position (Actor::mPos); the preloader reads x/y/z here"),
+    ("actor_rotation", 0x238, "view rotation (yaw, pitch); the preloader reads two floats here"),
+]
+
+_RET = 0xD65F03C0
+
+
+def _iter_words(image: ElfImage):
+    blob = image.section_bytes(".text")
+    for offset in range(0, len(blob) - 3, 4):
+        yield offset, struct.unpack_from("<I", blob, offset)[0]
+
+
+def member_address_getters_from_bytes(blob: bytes) -> set[int]:
+    """The bytes-based core of [`member_address_getters`], so it is unit-testable."""
+    out: set[int] = set()
+    for offset in range(0, len(blob) - 7, 4):
+        word = struct.unpack_from("<I", blob, offset)[0]
+        if (word & 0xFFC00000) != 0x91000000:
+            continue
+        rn, rd, imm = (word >> 5) & 0x1F, word & 0x1F, (word >> 10) & 0xFFF
+        if rn != 0 or rd != 0 or imm == 0:
+            continue
+        if struct.unpack_from("<I", blob, offset + 4)[0] == _RET:
+            out.add(imm)
+    return out
+
+
+def member_address_getters(image: ElfImage) -> set[int]:
+    """Displacements returned by an `add x0, x0, #imm; ret` getter.
+
+    That two-instruction shape returns `this + imm` - the address of a member -
+    which is how the engine exposes a Vec3 field it does not want to copy.
+    """
+    return member_address_getters_from_bytes(image.section_bytes(".text"))
+
+
+def _decode_float_access(word: int) -> tuple[int, int] | None:
+    """`(base_reg, disp)` for a SIMD/FP load/store, else None.
+
+    The SIMD&FP load/store encodings are `size 111 V=1 01 opc imm12 Rn Rt`
+    (scaled) and `size 111 V=1 00 opc 0 imm9 Rn Rt` (unscaled). With the top byte
+    that means 0xBD for a 4-byte scaled access, 0xBC unscaled, and 0xFD/0xFC for
+    the 8-byte forms.
+    """
+    top = word & 0xFF000000
+    if top in (0xBD000000, 0xFD000000):
+        scale = 4 if top == 0xBD000000 else 8
+        imm12 = (word >> 10) & 0xFFF
+        return (word >> 5) & 0x1F, imm12 * scale
+    if top in (0xBC000000, 0xFC000000):
+        imm9 = (word >> 12) & 0x1FF
+        disp = imm9 - 0x200 if imm9 & 0x100 else imm9
+        return (word >> 5) & 0x1F, disp
+    return None
+
+
+def vec3_float_groups_from_bytes(blob: bytes) -> set[int]:
+    """The bytes-based core of [`vec3_float_groups`], so it is unit-testable."""
+    per_fn: dict[tuple[int, int], set[int]] = {}
+    current_fn = 0
+    for offset in range(0, len(blob) - 3, 4):
+        word = struct.unpack_from("<I", blob, offset)[0]
+        if (word & 0x0000FFFF) == 0x7BFD and (word & 0xFF000000) == 0xA9000000:
+            current_fn = offset  # frame-setup prologue: a new function begins
+        access = _decode_float_access(word)
+        if access is None:
+            continue
+        reg, disp = access
+        if reg in (29, 31) or disp < 0:
+            continue
+        per_fn.setdefault((current_fn, reg), set()).add(disp)
+
+    groups: set[int] = set()
+    for disps in per_fn.values():
+        for d in disps:
+            if d + 4 in disps and d + 8 in disps:
+                groups.add(d)
+    return groups
+
+
+def vec3_float_groups(image: ElfImage) -> set[int]:
+    """Displacements read as a float vector (`off`, `off+4`, `off+8`) in one function.
+
+    A Vec3 field shows up as three consecutive float accesses off one register
+    within a single function, so the grouping is by (function, base register) -
+    grouping per instruction would never see the three together. `sp`/`fp`-based
+    accesses are excluded because stack frames reuse these displacements.
+    """
+    return vec3_float_groups_from_bytes(image.section_bytes(".text"))
+
+
+def verify_known_offsets(image: ElfImage) -> list[dict]:
+    """Checks each known entity offset against this build's code."""
+    getters = member_address_getters(image)
+    vec3 = vec3_float_groups(image)
+    results = []
+    for name, disp, meaning in KNOWN_ENTITY_OFFSETS:
+        has_getter = disp in getters
+        has_vec3 = disp in vec3
+        results.append(
+            {
+                "name": name,
+                "offset": disp,
+                "meaning": meaning,
+                "verified": bool(has_getter and has_vec3),
+                "evidence": {
+                    "member_address_getter": has_getter,
+                    "float_vec3_group": has_vec3,
+                },
+            }
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # What to resolve
 # ---------------------------------------------------------------------------
 
@@ -552,6 +679,31 @@ ENTITY_SEAM_FIELDS = [
     ("entityRotationOffset", "the view-rotation offset inside an Actor"),
 ]
 
+# Which verified field feeds which EntitySeamOffsets name. A verified offset is
+# recorded as a real value; an unverified one stays null (never guessed).
+_VERIFIED_TO_FIELD = {
+    "actor_position": "entityPositionOffset",
+    "actor_rotation": "entityRotationOffset",
+}
+
+
+def _entity_seam_fields(image: ElfImage) -> list[dict]:
+    """The four EntitySeamOffsets fields, with the verified ones filled in.
+
+    A field is only given a value when the verifier proved it on this build; the
+    rest stay null. `levelEntityListOffset` and `entityRuntimeIdOffset` are not
+    recovered by this pass and must not be guessed.
+    """
+    verified = {v["name"]: v for v in verify_known_offsets(image)}
+    fields = []
+    for name, meaning in ENTITY_SEAM_FIELDS:
+        offset = None
+        for verified_name, field_name in _VERIFIED_TO_FIELD.items():
+            if field_name == name and verified.get(verified_name, {}).get("verified"):
+                offset = verified[verified_name]["offset"]
+        fields.append({"name": name, "meaning": meaning, "offset": offset})
+    return fields
+
 
 def build_report(image: ElfImage, version: str, so_sha256: str, so_bytes: int) -> dict:
     report: dict = {
@@ -562,17 +714,17 @@ def build_report(image: ElfImage, version: str, so_sha256: str, so_bytes: int) -
         "rtti_slots": [],
         "rtti_slots_by_needle": [],
         "signatures": [],
+        "entity_seam_verification": verify_known_offsets(image),
         "entity_seam_offsets": {
             "resolved": False,
             "reason": (
-                "Field offsets inside a live Level/Actor are not revealed by any "
-                "signature or RTTI name; they require disassembling the accessors. "
-                "Not fabricated - see docs/agent-notes/signature-derivation.md."
+                "The Actor position/rotation offsets are verified per build (see "
+                "entity_seam_verification) and filled in below. The two that remain "
+                "null - levelEntityListOffset and entityRuntimeIdOffset - are not "
+                "recovered: they need a deeper disassembly pass, and a guessed value "
+                "would fault the game thread. See docs/agent-notes/signature-derivation.md."
             ),
-            "fields": [
-                {"name": name, "meaning": meaning, "offset": None}
-                for name, meaning in ENTITY_SEAM_FIELDS
-            ],
+            "fields": _entity_seam_fields(image),
         },
     }
 
@@ -645,6 +797,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"  SIG {entry['name']}: {entry['status']} "
             f"({entry['match_count']} match(es))"
+        )
+    for entry in report["entity_seam_verification"]:
+        mark = "VERIFIED" if entry["verified"] else "NOT VERIFIED"
+        print(
+            f"  ENTITY {entry['name']} @ {entry['offset']:#x}: {mark} "
+            f"({entry['evidence']})"
         )
 
     if args.check_unique:

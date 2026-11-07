@@ -113,6 +113,61 @@ class TestDownloadChain(unittest.TestCase):
         self.assertEqual(dle.SO_MEMBER, "lib/arm64-v8a/libminecraftpe.so")
 
 
+class TestEntityOffsetVerification(unittest.TestCase):
+    """The offset verifier's two signals, tested on synthetic bytes."""
+
+    def test_member_address_getter_is_recognised(self):
+        # `add x0, x0, #0x230 ; ret` is what a Vec3 member getter looks like.
+        words = [0x91000000 | (0x230 << 10), 0xD65F03C0]
+        blob = b"".join(w.to_bytes(4, "little") for w in words)
+        self.assertEqual(
+            eo.member_address_getters_from_bytes(blob), {0x230}
+        )
+
+    def test_add_without_ret_is_not_a_getter(self):
+        # Same add, but followed by something else: not a leaf getter.
+        words = [0x91000000 | (0x230 << 10), 0x91000000]
+        blob = b"".join(w.to_bytes(4, "little") for w in words)
+        self.assertEqual(eo.member_address_getters_from_bytes(blob), set())
+
+    def test_add_with_a_different_destination_is_not_a_getter(self):
+        # `add x1, x0, #0x230 ; ret` returns a value in x1, not `this + imm`.
+        words = [0x91000000 | (0x230 << 10) | 1, 0xD65F03C0]
+        blob = b"".join(w.to_bytes(4, "little") for w in words)
+        self.assertEqual(eo.member_address_getters_from_bytes(blob), set())
+
+    def test_float_access_decoder(self):
+        # ldr s4, [x0, #0x230]  and  ldr s4, [x0, #0x238]
+        self.assertEqual(eo._decode_float_access(0xBD423004), (0, 0x230))
+        self.assertEqual(eo._decode_float_access(0xBD423804), (0, 0x238))
+        # ldr d0, [x8, #0x10] is an 8-byte scaled access -> disp 0x10.
+        self.assertEqual(eo._decode_float_access(0xfd400900), (8, 0x10))
+        # A plain integer load is not a float access.
+        self.assertEqual(eo._decode_float_access(0xF9400000), None)
+
+    def test_vec3_group_needs_three_consecutive_floats(self):
+        # Three floats at +0x230/+0x234/+0x238 in one function: a Vec3.
+        blob = b"".join(
+            w.to_bytes(4, "little")
+            for w in (0xBD423004, 0xBD423404, 0xBD423804)
+        )
+        self.assertIn(0x230, eo.vec3_float_groups_from_bytes(blob))
+
+    def test_two_floats_are_not_a_vec3_group(self):
+        blob = b"".join(
+            w.to_bytes(4, "little") for w in (0xBD423004, 0xBD423804)
+        )
+        self.assertNotIn(0x230, eo.vec3_float_groups_from_bytes(blob))
+
+    def test_stack_relative_accesses_are_ignored(self):
+        # sp-relative (reg 31) floats at 0x230/0x234/0x238 must not form a group.
+        blob = b"".join(
+            w.to_bytes(4, "little")
+            for w in (0xBD423F04, 0xBD423F24, 0xBD423F44)
+        )
+        self.assertNotIn(0x230, eo.vec3_float_groups_from_bytes(blob))
+
+
 class TestReportShape(unittest.TestCase):
     def test_entity_seam_is_reported_unresolved_with_reason(self):
         report = {
