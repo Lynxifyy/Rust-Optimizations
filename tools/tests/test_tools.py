@@ -168,6 +168,34 @@ class TestEntityOffsetVerification(unittest.TestCase):
         self.assertNotIn(0x230, eo.vec3_float_groups_from_bytes(blob))
 
 
+class TestEntityChainDetection(unittest.TestCase):
+    """The Level -> ActorManager chain primitives, on synthetic words."""
+
+    def test_bl_target_decodes_forward_and_backward(self):
+        # bl with imm26 = +4 instructions
+        w = 0x94000000 | 4
+        self.assertEqual(eo._bl_target(w, 0x1000), 0x1000 + 16)
+        # bl with a negative offset (two's complement 26-bit)
+        w = 0x94000000 | ((1 << 26) - 4)
+        self.assertEqual(eo._bl_target(w, 0x1000), 0x1000 - 16)
+
+    def test_bl_target_rejects_non_branch(self):
+        self.assertIsNone(eo._bl_target(0xD65F03C0, 0x1000))  # ret
+
+    def test_mov_x0_source(self):
+        # mov x0, x20  == orr x0, xzr, x20
+        w = 0xAA0003E0 | (20 << 16)
+        self.assertEqual(eo._mov_x0_source(w), 20)
+        # mov x0, x0 is not interesting but still parses
+        self.assertEqual(eo._mov_x0_source(0xAA0003E0), 0)
+        # Not a mov into x0.
+        self.assertIsNone(eo._mov_x0_source(0xD65F03C0))
+
+    def test_actor_manager_vector_offset_is_the_libcxx_vector(self):
+        # The recovered constant: the vector is the manager's first member.
+        self.assertEqual(eo.ACTOR_MANAGER_VECTOR_OFFSET, 0x8)
+
+
 class TestReportShape(unittest.TestCase):
     def test_entity_seam_is_reported_unresolved_with_reason(self):
         report = {
