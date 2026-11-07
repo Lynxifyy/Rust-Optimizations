@@ -1,0 +1,141 @@
+{
+  "version": "26.62",
+  "so_bytes": 342231392,
+  "so_sha256": "2abbb29858cbdf313aae795f4a8dcd68e2c43884a1f00ad86701b482dec6d7b9",
+  "abi": "arm64-v8a",
+  "rtti_slots": [
+    {
+      "type_name": "14ClientInstance",
+      "slot": 31,
+      "function_vaddr": 163051216,
+      "function_file_offset": 163051216,
+      "vtable_vaddr": 327746728,
+      "resolved_by": "slot-index",
+      "description": "getLocalPlayer (local-player feed)",
+      "prologue": [
+        "sub sp, sp, #0x50",
+        "stp x29, x30, [sp, #0x30]",
+        "str x19, [sp, #0x40]",
+        "add x29, sp, #0x30"
+      ]
+    },
+    {
+      "type_name": "18LivePlayerRenderer",
+      "slot": 17,
+      "function_vaddr": 161642204,
+      "function_file_offset": 161642204,
+      "vtable_vaddr": 327682344,
+      "resolved_by": "slot-index",
+      "description": "render (player-render / cosmetics seam)",
+      "prologue": [
+        "stp d15, d14, [sp, #-0xa0]!",
+        "stp d13, d12, [sp, #0x10]",
+        "stp d11, d10, [sp, #0x20]",
+        "stp d9, d8, [sp, #0x30]"
+      ]
+    },
+    {
+      "type_name": "20ClientNetworkHandler",
+      "slot": 40,
+      "function_vaddr": 170807748,
+      "function_file_offset": 170807748,
+      "vtable_vaddr": 328513016,
+      "resolved_by": "slot-index",
+      "description": "player-join packet read",
+      "prologue": [
+        "str d8, [sp, #-0x70]!",
+        "stp x29, x30, [sp, #0x10]",
+        "stp x28, x27, [sp, #0x20]",
+        "stp x26, x25, [sp, #0x30]"
+      ]
+    }
+  ],
+  "rtti_slots_by_needle": [
+    {
+      "type_name": "18LivePlayerRenderer",
+      "slot": 17,
+      "function_vaddr": 161642204,
+      "function_file_offset": 161642204,
+      "vtable_vaddr": 327682344,
+      "resolved_by": "needle:variable.player_x_rotation",
+      "description": "render slot identified by the string it references",
+      "prologue": [
+        "stp d15, d14, [sp, #-0xa0]!",
+        "stp d13, d12, [sp, #0x10]",
+        "stp d11, d10, [sp, #0x20]",
+        "stp d9, d8, [sp, #0x30]"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "name": "aarch64_function_prologue",
+      "pattern": "FD 7B BF A9",
+      "description": "stp x29, x30, [sp, #-0x10]! - the common frame-setup prologue (many hits)",
+      "match_count": 43678,
+      "matches": [
+        120045272,
+        120919916,
+        120922360,
+        120922456,
+        120923676,
+        120923704,
+        120923800,
+        120924148,
+        120924944,
+        120925256,
+        120925368,
+        120926240,
+        120927096,
+        120927372,
+        120927404,
+        120927512
+      ],
+      "file_offsets": [
+        120045272,
+        120919916,
+        120922360,
+        120922456,
+        120923676,
+        120923704,
+        120923800,
+        120924148,
+        120924944,
+        120925256,
+        120925368,
+        120926240,
+        120927096,
+        120927372,
+        120927404,
+        120927512
+      ],
+      "status": "ambiguous"
+    }
+  ],
+  "entity_seam_offsets": {
+    "resolved": false,
+    "reason": "Field offsets inside a live Level/Actor are not revealed by any signature or RTTI name; they require disassembling the accessors. Not fabricated - see docs/agent-notes/signature-derivation.md.",
+    "fields": [
+      {
+        "name": "levelEntityListOffset",
+        "meaning": "the Level/Dimension entity-list vector offset",
+        "offset": null
+      },
+      {
+        "name": "entityRuntimeIdOffset",
+        "meaning": "the runtime id offset inside an Actor",
+        "offset": null
+      },
+      {
+        "name": "entityPositionOffset",
+        "meaning": "the position offset inside an Actor",
+        "offset": null
+      },
+      {
+        "name": "entityRotationOffset",
+        "meaning": "the view-rotation offset inside an Actor",
+        "offset": null
+      }
+    ]
+  }
+}
