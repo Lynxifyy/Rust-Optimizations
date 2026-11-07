@@ -1,0 +1,15 @@
+# Exported-symbol policy for libglowberry_rust.so.
+#
+# The preloader loads the .so and calls PLGetModRegistration, and any native code
+# may dlopen it to use the Rust core, so the gbr_* C ABI stays visible too.
+# Everything else - fmt, the C++ runtime glue, Rust internals - is local, which
+# shrinks the dynamic symbol table (faster dlopen) and stops the mod's copies of
+# fmt from clashing with the game's or the preloader's. This is the same intent
+# as the preloader's own --exclude-libs,ALL, made explicit.
+{
+  global:
+    PLGetModRegistration;
+    gbr_*;
+  local:
+    *;
+};

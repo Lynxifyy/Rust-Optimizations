@@ -1,0 +1,242 @@
+name: Build .so Mod
+
+# Builds libglowberry_rust.so - the GlowberryClient native mod that wraps the
+# Rust acceleration core - and verifies it before it is shipped.
+#
+# arm64-v8a only. That is not a simplification: the client ships a single arm64
+# APK (`abiFilters 'arm64-v8a'`), and the preloader this mod plugs into refuses
+# any other ABI (it is vendored for arm64 GlossHook only). A 32-bit artifact
+# would be one the client could never load.
+
+on:
+  push:
+    branches: [main, "feat/**"]
+    tags: ["v*"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "cpp/**"
+      - "mod/**"
+      - ".github/workflows/build.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "cpp/**"
+      - "mod/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: build-so-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_TARGET: aarch64-linux-android
+  # The NDK the client pins (app/build.gradle: ndkVersion "28.2.13676358").
+  NDK_VERSION: "28.2.13676358"
+  ANDROID_API_LEVEL: "28"
+  LIB_NAME: libglowberry_rust.so
+  # The preloader-android commit the client's submodule pins. The mod compiles
+  # against exactly these public headers.
+  PRELOADER_REPO: https://github.com/ChimeraAnt-DEV/preloader-android
+  PRELOADER_SHA: "6d7cf530b87d826fc568f4b1f2bc73e3794432ae"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Host gate. Runs everything that does not need a device, including the C++
+  # smoke test that links the core and calls its C ABI - the only check that
+  # proves the extern "C" boundary and the repr(C) layouts.
+  # ---------------------------------------------------------------------------
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host-tests
+
+      - name: Rust tests, lints and the C ABI smoke test
+        run: bash cpp/run_host_tests.sh
+
+  # ---------------------------------------------------------------------------
+  # Cross-compile the mod for arm64-v8a and verify the artifact.
+  # ---------------------------------------------------------------------------
+  build-so:
+    name: Build arm64-v8a
+    needs: host-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain + ${{ env.RUST_TARGET }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ndk-${{ env.RUST_TARGET }}
+
+      - name: Set up Android SDK + NDK ${{ env.NDK_VERSION }}
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "ndk;${{ env.NDK_VERSION }}"
+
+      - name: Export the NDK path
+        run: |
+          ndk_root="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+          test -d "${ndk_root}"
+          echo "ANDROID_NDK_HOME=${ndk_root}" >> "$GITHUB_ENV"
+          echo "NDK_BIN=${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+
+      - name: Fetch the pinned preloader headers
+        run: |
+          git clone --filter=blob:none "${PRELOADER_REPO}" third_party/preloader-android
+          git -C third_party/preloader-android checkout "${PRELOADER_SHA}"
+          test -f third_party/preloader-android/include/pl/Mod.hpp
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Build the Rust core (release, arm64)
+        # cargo-ndk configures the NDK linker and archiver for the target. A plain
+        # `cargo build --target aarch64-linux-android` does not, so the final link
+        # falls back to the host `cc` and fails on the foreign object format.
+        run: cargo ndk -t arm64-v8a --platform "${ANDROID_API_LEVEL}" build --release
+        env:
+          # NEON is mandatory on aarch64; state it so the flag is never dropped.
+          RUSTFLAGS: "-C target-feature=+neon"
+
+      - name: Configure the mod (NDK toolchain, arm64-v8a)
+        run: |
+          cmake -B build/mod \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API_LEVEL}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPRELOADER_ANDROID_ROOT="${GITHUB_WORKSPACE}/third_party/preloader-android" \
+            -DGLOWBERRY_RUST_LIB="${GITHUB_WORKSPACE}/target/${RUST_TARGET}/release/libglowberry_rust.a" \
+            mod
+
+      - name: Build the mod .so
+        run: cmake --build build/mod --config Release --parallel
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp "$(find build/mod -name "${LIB_NAME}" | head -1)" "dist/${LIB_NAME}"
+
+      - name: Verify ELF + exports
+        run: |
+          set -euo pipefail
+          so="dist/${LIB_NAME}"
+          readelf="${NDK_BIN}/llvm-readelf"
+          nm="${NDK_BIN}/llvm-nm"
+
+          header="$("${readelf}" -h "${so}")"
+          echo "${header}"
+          echo "${header}" | grep -q "Shared object file" \
+            || { echo "::error::${so} is not an ELF shared object"; exit 1; }
+          echo "${header}" | grep -q "AArch64" \
+            || { echo "::error::${so} is not AArch64"; exit 1; }
+
+          # Android links bionic, never glibc.
+          if "${readelf}" -s "${so}" | grep -q "GLIBC"; then
+            echo "::error::${so} references GLIBC symbols"; exit 1
+          fi
+
+          exports="$("${nm}" -D --defined-only "${so}")"
+          echo "${exports}" | grep -q "PLGetModRegistration" \
+            || { echo "::error::${so} is missing the PLGetModRegistration mod entrypoint"; exit 1; }
+          echo "${exports}" | grep -q " gbr_version$" \
+            || { echo "::error::${so} does not export the Rust core (gbr_version)"; exit 1; }
+
+      - name: Upload the mod .so
+        uses: actions/upload-artifact@v4
+        with:
+          name: glowberry-rust-arm64-v8a
+          # A literal path: GitHub Actions does not expand shell ${VAR} in `with:`.
+          path: dist/libglowberry_rust.so
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Package the mod (the .so plus its manifest) and publish a Release on tags.
+  # ---------------------------------------------------------------------------
+  package:
+    name: Package mod
+    needs: build-so
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the built .so
+        uses: actions/download-artifact@v4
+        with:
+          name: glowberry-rust-arm64-v8a
+          path: dist
+
+      - name: Assemble the mod folder
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          case "${GITHUB_REF}" in
+            refs/tags/*) version="${GITHUB_REF_NAME}" ;;
+            *) version="0.1.0-${GITHUB_SHA::12}" ;;
+          esac
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+
+          pkg="glowberry-rust-${version}"
+          mkdir -p "dist/${pkg}"
+          cp "dist/${LIB_NAME}" "dist/${pkg}/${LIB_NAME}"
+          cp mod/manifest.json "dist/${pkg}/manifest.json"
+          {
+            echo "libglowberry_rust - GlowberryClient native mod (Rust acceleration core)"
+            echo "version: ${version}"
+            echo "git sha: ${GITHUB_SHA}"
+            echo "abi: arm64-v8a"
+            echo "ndk: ${NDK_VERSION} (api ${ANDROID_API_LEVEL})"
+            echo "rust: $(rustc --version 2>/dev/null || echo 'n/a')"
+            echo "preloader: ${PRELOADER_SHA}"
+          } > "dist/${pkg}/BUILD_INFO.txt"
+          ( cd dist && sha256sum "${pkg}/${LIB_NAME}" > "${pkg}/SHA256SUMS.txt" )
+          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+
+      - name: Zip the mod
+        run: |
+          set -euo pipefail
+          ( cd dist && zip -r "${PKG}.zip" "${PKG}" )
+          ls -la dist
+
+      - name: Upload the mod bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: glowberry-rust-mod
+          path: dist/${{ env.PKG }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish a Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ env.PKG }}.zip
+          generate_release_notes: true
