@@ -1,0 +1,8 @@
+{
+  "type": "preload-native",
+  "name": "Glowberry Rust Core",
+  "author": "Lynxifyy",
+  "version": "0.1.0",
+  "entry": "libglowberry_rust.so",
+  "minecraft_versions": []
+}
