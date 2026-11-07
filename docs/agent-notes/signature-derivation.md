@@ -65,19 +65,60 @@ function, not copied from a list.
 
 ## What the map does NOT contain, and why
 
-`entity_seam_offsets` is emitted **unresolved** with the reason. Those four
-fields (`levelEntityListOffset`, `entityRuntimeIdOffset`, `entityPositionOffset`,
-`entityRotationOffset`) are byte offsets *inside a live `Level`/`Actor`*. Neither
-a byte signature nor an RTTI name reveals them - they come from disassembling the
-accessors that read those members. Emitting a guessed number there would be a
-fault on the game thread, so the tool says "not recovered" and the mod keeps the
-fallback. Recovering them is the next job, and it is a disassembly pass, not a
-signature scan.
+`entity_seam_offsets` is partially filled. Two of the four fields are **verified
+per build** and carry a value; two remain `null`.
 
-Likewise the `LevelChunk` and mesher functions named in the original plan are not
-in the map: the game's chunk mesher is not reachable by any anchor (see
-`docs/agents/native-entity-camera-feed-*` in the client repo). The map records
-what is actually resolvable.
+| Field | Status | How |
+|---|---|---|
+| `entityPositionOffset` | **verified = `0x230`** | member-address getter + float-vec3 group |
+| `entityRotationOffset` | **verified = `0x238`** | member-address getter + float-vec3 group |
+| `levelEntityListOffset` | **null** | not recovered (needs a deeper pass) |
+| `entityRuntimeIdOffset` | **null** | not recovered (needs a deeper pass) |
+
+### How the two are verified
+
+Recovering a *new* offset needs judgement, but **verifying a known one is
+deterministic**, so the tool checks two independent signals per build:
+
+1. **A member-address getter**: the two-instruction shape `add x0, x0, #0x230;
+   ret`, which returns `this + 0x230`. The engine uses these to hand out a `Vec3`
+   field's address instead of copying it. The scan found a getter for both
+   `0x230` and `0x238`.
+2. **A float-vec3 access group**: a function that reads `off`, `off+4`, `off+8`
+   as SIMD/FP floats off the same register - the shape of a `Vec3` read. `sp`/
+   `fp`-relative accesses are excluded because stack frames reuse these
+   displacements.
+
+Both signals hold for both offsets on **26.52, 26.60 and 26.62**. That turns "the
+preloader assumes `Actor+0x230`" into "`0x230` is still correct on this build" -
+which is exactly what a per-build map is for, and it matches the offsets the
+preloader hardcodes in `GameLocalPlayer.cpp`.
+
+### What is still not recovered
+
+`levelEntityListOffset` and `entityRuntimeIdOffset` are **null**, not guessed.
+Notes for the next pass (also in issue #4):
+
+- `12ActorManager` and `5Level` **are** RTTI-resolvable (`resolveVtableFunction`
+  finds them), contrary to an earlier assumption that the entity manager had no
+  RTTI name. `ActorManager`'s vtable address point is `0x13d6eda8` on 26.60, and
+  its slots 0/1/2 are member-address getters returning `this + 0x90 / 0xe8 /
+  0x140` - one of those containers holds the actor vector. Slot 10 iterates a
+  `{begin, end}` vector at `+8`/`+0x10` of some object, so the container layout is
+  the libc++ vector `EntityListWalk` already expects.
+- The hard part is the **Level -> ActorManager link**: on 26.60 the ActorManager
+  is constructed at `0x103b1884` (called from `0x10aff638`), but the store of the
+  resulting pointer into the Level is buried in a very large constructor. Pinning
+  the exact Level member offset needs a focused pass on that constructor (or on
+  `Level`'s pointer-member getters, of which `0x130`, `0x150`, `0x2e0` and
+  `0x350` are candidates).
+- `entityRuntimeIdOffset` is a field of `Actor`; the Actor vtable's slots resolve
+  to pure-virtual interface bases, so the offset has to come from a function that
+  reads the runtime id (e.g. the packet handlers), not from a vtable getter.
+
+The `LevelChunk` and chunk-mesher functions named in the original plan remain
+absent: the game's chunk mesher is not reachable by any anchor (the client
+documents this).
 
 ## About external signature databases
 

@@ -112,6 +112,28 @@
       "status": "ambiguous"
     }
   ],
+  "entity_seam_verification": [
+    {
+      "name": "actor_position",
+      "offset": 560,
+      "meaning": "Vec3 position (Actor::mPos); the preloader reads x/y/z here",
+      "verified": true,
+      "evidence": {
+        "member_address_getter": true,
+        "float_vec3_group": true
+      }
+    },
+    {
+      "name": "actor_rotation",
+      "offset": 568,
+      "meaning": "view rotation (yaw, pitch); the preloader reads two floats here",
+      "verified": true,
+      "evidence": {
+        "member_address_getter": true,
+        "float_vec3_group": true
+      }
+    }
+  ],
   "entity_seam_offsets": {
     "resolved": false,
     "reason": "Field offsets inside a live Level/Actor are not revealed by any signature or RTTI name; they require disassembling the accessors. Not fabricated - see docs/agent-notes/signature-derivation.md.",
@@ -129,12 +151,12 @@
       {
         "name": "entityPositionOffset",
         "meaning": "the position offset inside an Actor",
-        "offset": null
+        "offset": 560
       },
       {
         "name": "entityRotationOffset",
         "meaning": "the view-rotation offset inside an Actor",
-        "offset": null
+        "offset": 568
       }
     ]
   }
