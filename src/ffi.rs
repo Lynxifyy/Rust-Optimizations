@@ -391,6 +391,89 @@ pub unsafe extern "C" fn gbr_offsets_entity_seam_complete(map: *const GbrOffsetM
     u32::from((*map).inner.entity_seam_complete())
 }
 
+/// 1 when the map carries everything the entity-list walk needs, else 0.
+///
+/// # Safety
+/// `map` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_offsets_entity_walk_ready(map: *const GbrOffsetMap) -> u32 {
+    if map.is_null() {
+        return 0;
+    }
+    u32::from(crate::entities::EntitySeam::from_map(&(*map).inner).is_some())
+}
+
+/// Walks the live entity list from a `Level*` and writes the `Actor*` pointers.
+///
+/// Returns the number of actors written (0 when the walk is refused or the list
+/// is empty), or -1 on a null argument. `out_actors` receives up to `capacity`
+/// pointers.
+///
+/// # Safety
+/// `map` must be valid and carry the entity-seam offsets; `level` must be a live
+/// `Level*` the game returned, read on the game thread. `out_actors` must have
+/// room for `capacity` pointers.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_entity_walk(
+    map: *const GbrOffsetMap,
+    level: *const u8,
+    out_actors: *mut *const u8,
+    capacity: u32,
+) -> c_int {
+    if map.is_null() || level.is_null() || out_actors.is_null() {
+        return -1;
+    }
+    let Some(seam) = crate::entities::EntitySeam::from_map(&(*map).inner) else {
+        return 0;
+    };
+    let Some(range) = crate::entities::read_entity_range(level, &seam) else {
+        return 0;
+    };
+    let total = range.len().min(capacity as usize);
+    let out = std::slice::from_raw_parts_mut(out_actors, capacity as usize);
+    let mut written = 0usize;
+    for i in 0..total {
+        match range.actor_at(i) {
+            Some(actor) => {
+                out[written] = actor;
+                written += 1;
+            }
+            None => continue,
+        }
+    }
+    written as c_int
+}
+
+/// Reads one entity's position (`Vec3`) into `out[0..3]`.
+///
+/// Returns 0 on success, 1 when the read is refused (null actor, bad offset, or
+/// a non-finite value), -1 on a null argument.
+///
+/// # Safety
+/// `map` must be valid; `actor` must be a live `Actor*`; `out` must have room
+/// for three floats.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_entity_position(
+    map: *const GbrOffsetMap,
+    actor: *const u8,
+    out: *mut f32,
+) -> c_int {
+    if map.is_null() || actor.is_null() || out.is_null() {
+        return -1;
+    }
+    let Some(seam) = crate::entities::EntitySeam::from_map(&(*map).inner) else {
+        return 1;
+    };
+    match crate::entities::read_entity_position(actor, seam.position_offset) {
+        Some(position) => {
+            let dst = std::slice::from_raw_parts_mut(out, 3);
+            dst.copy_from_slice(&position);
+            0
+        }
+        None => 1,
+    }
+}
+
 /// Copies the map's version string into `out` (NUL-terminated, truncated to
 /// `cap`). Returns the length written, excluding the NUL. 0 on a null argument.
 ///

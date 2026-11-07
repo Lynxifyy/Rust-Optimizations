@@ -317,6 +317,11 @@ GbrOffsetMap *load_offset_map(const std::string &mod_root, const GlowberryRustCo
   if (gbr_offsets_entity_seam_complete(map) == 0) {
     log.info("offset map {} does not carry recovered entity-seam offsets yet", version);
   }
+  if (gbr_offsets_entity_walk_ready(map) != 0) {
+    log.info("entity-list walk is available: level -> ActorManager -> vector<Actor*>");
+  } else {
+    log.info("entity-list walk is not available from this map");
+  }
   report_offset_map(map, log);
   return map;
 }

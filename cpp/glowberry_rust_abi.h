@@ -168,6 +168,21 @@ uint32_t gbr_offsets_verify_build(const struct GbrOffsetMap *map,
 // 1 when the entity seam is fully recovered, else 0.
 uint32_t gbr_offsets_entity_seam_complete(const struct GbrOffsetMap *map);
 
+// 1 when the map carries everything the entity-list walk needs, else 0.
+uint32_t gbr_offsets_entity_walk_ready(const struct GbrOffsetMap *map);
+
+// Walks the live entity list from a Level*. Writes up to `capacity` Actor*
+// pointers into `out_actors` and returns the count (0 when refused or empty), or
+// -1 on a null argument. Reads game memory: call on the game thread with a
+// Level* the game returned.
+int gbr_entity_walk(const struct GbrOffsetMap *map, const uint8_t *level,
+                    const uint8_t **out_actors, uint32_t capacity);
+
+// Reads one entity's position (Vec3) into out[0..3]. Returns 0 on success, 1
+// when the read is refused (null actor, bad offset, non-finite), -1 on null.
+int gbr_entity_position(const struct GbrOffsetMap *map, const uint8_t *actor,
+                        float *out);
+
 // Copies the map's version string into `out` (NUL-terminated, truncated to cap).
 // Returns the length written, excluding the NUL.
 size_t gbr_offsets_version(const struct GbrOffsetMap *map, uint8_t *out, size_t cap);

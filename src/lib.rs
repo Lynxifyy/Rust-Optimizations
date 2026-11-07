@@ -9,12 +9,14 @@
 //! - [`math`]   - SIMD 3-D math: AABB collision, ray casts, frustum culling.
 //! - [`mesher`] - binary greedy voxel meshing with baked ambient occlusion.
 //! - [`offsets`] - the per-build offset map loader (fail-closed).
+//! - [`entities`] - the two-step live entity-list walk (fail-closed).
 //! - [`parallel`] - a bounded scoped worker pool for off-thread meshing.
 //! - [`pipeline`] - the ring + worker work loop (submit -> mesh -> drain).
 //! - [`world`]    - a layered world description turned into a meshed volume.
 //! - [`ring`]   - a bounded lock-free multi-producer/multi-consumer ring buffer.
 //! - [`ffi`]    - the C ABI the C++ shim links against.
 
+pub mod entities;
 pub mod ffi;
 pub mod math;
 pub mod mesher;

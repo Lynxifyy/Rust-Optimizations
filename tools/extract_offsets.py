@@ -636,6 +636,155 @@ def verify_known_offsets(image: ElfImage) -> list[dict]:
     return results
 
 
+# --- The Level -> ActorManager chain -----------------------------------------
+#
+# `levelEntityListOffset` is not a struct field on the Level; it is the offset of
+# the `ActorManager*` member. The actor list is the `{begin, end, cap}` vector at
+# `ActorManager + 0x8`, so the walk is two steps:
+#
+#     level + levelEntityListOffset  ->  ActorManager*  ->  + 0x8  ->  {begin, end}
+#
+# Recovering it deterministically (no hardcoded addresses):
+#
+#   1. resolve `ActorManager` by RTTI name;
+#   2. find its constructor: the function that stores the vtable address point
+#      (vptr) into `this`;
+#   3. find the call sites of that constructor, follow the register moved into
+#      `x0`, and read the `str xN, [xBase, #off]` that lands the pointer;
+#   4. keep only offsets that are stored by exactly one call site (an ambiguity
+#      means the rule caught something else).
+#
+# Step 4 is the guard that makes this a measurement rather than a guess: on
+# 26.60 it yields a single offset, `0x3e0`.
+
+# The libc++ `std::vector` offset inside the ActorManager (its first member).
+ACTOR_MANAGER_VECTOR_OFFSET = 0x8
+
+# How far past a `bl` to look for the pointer store.
+_STORE_SEARCH_WINDOW = 60
+
+
+def _bl_target(word: int, pc: int) -> int | None:
+    if (word & 0xFC000000) != 0x94000000:
+        return None
+    imm = word & 0x3FFFFFF
+    if imm & (1 << 25):  # 26-bit signed immediate
+        imm -= 1 << 26
+    return pc + (imm << 2)
+
+
+def _mov_x0_source(word: int) -> int | None:
+    """The source register of `mov x0, xN`, else None."""
+    if (word & 0xFFE0FFE0) == 0xAA0003E0:
+        return (word >> 16) & 0x1F
+    return None
+
+
+def _find_actor_manager_vptr(image: ElfImage) -> int:
+    typeinfo, _ = find_typeinfo(image, "12ActorManager")
+    if not typeinfo:
+        return 0
+    vtable = find_primary_vtable(image, typeinfo)
+    if not vtable:
+        return 0
+    # A constructor stores the vptr (address point + 8), not the address point.
+    return vtable + 8
+
+
+def find_actor_manager_constructor(image: ElfImage) -> int:
+    """The function that writes the ActorManager vptr into `this` (x0), or 0."""
+    vptr = _find_actor_manager_vptr(image)
+    if not vptr:
+        return 0
+    blob = image.section_bytes(".text")
+    base = image.section_vaddr(".text")
+    n = len(blob) // 4
+    page = vptr & ~0xFFF
+    low = vptr & 0xFFF
+
+    for i in range(n):
+        word = struct.unpack_from("<I", blob, i * 4)[0]
+        pc = base + i * 4
+        if _decode_adrp_page(word, pc) != page:
+            continue
+        rd = word & 0x1F
+        for j in range(1, 6):
+            if i + j >= n:
+                break
+            w2 = struct.unpack_from("<I", blob, (i + j) * 4)[0]
+            add = _is_add_immediate(w2)
+            if add is None or add[0] != rd or (w2 & 0x1F) != rd or add[1] != low:
+                continue
+            # `str x{rd}, [x0]` within a few instructions marks the constructor.
+            for k in range(1, 9):
+                if i + j + k >= n:
+                    break
+                w3 = struct.unpack_from("<I", blob, (i + j + k) * 4)[0]
+                if (w3 & 0xFFC00000) == 0xF9000000 and (w3 & 0x1F) == rd and ((w3 >> 5) & 0x1F) == 0:
+                    return _function_start(image, pc)
+    return 0
+
+
+def _function_start(image: ElfImage, addr: int) -> int:
+    """Walk back to the frame-setup prologue that opens the function at `addr`."""
+    blob = image.section_bytes(".text")
+    base = image.section_vaddr(".text")
+    offset = addr - base
+    for back in range(0, 0x8000, 4):
+        if offset - back < 0:
+            break
+        word = struct.unpack_from("<I", blob, offset - back)[0]
+        if (word & 0x0000FFFF) == 0x7BFD and (word & 0xFF000000) == 0xA9000000:
+            return addr - back
+    return addr
+
+
+def find_level_entity_manager_offset(image: ElfImage) -> int:
+    """The Level member that holds the `ActorManager*`, or 0.
+
+    Returns a value only when exactly one offset is stored by exactly one call
+    site of the ActorManager constructor - an ambiguous result is refused.
+    """
+    ctor = find_actor_manager_constructor(image)
+    if not ctor:
+        return 0
+    blob = image.section_bytes(".text")
+    base = image.section_vaddr(".text")
+    n = len(blob) // 4
+
+    candidates: dict[int, int] = {}
+    for i in range(n):
+        word = struct.unpack_from("<I", blob, i * 4)[0]
+        pc = base + i * 4
+        if _bl_target(word, pc) != ctor:
+            continue
+        # Which register was moved into x0 just before the call?
+        source = None
+        for j in range(1, 5):
+            if i - j < 0:
+                break
+            src = _mov_x0_source(struct.unpack_from("<I", blob, (i - j) * 4)[0])
+            if src is not None:
+                source = src
+                break
+        if source is None:
+            continue
+        for k in range(1, _STORE_SEARCH_WINDOW):
+            if i + k >= n:
+                break
+            w2 = struct.unpack_from("<I", blob, (i + k) * 4)[0]
+            if (w2 & 0xFFC00000) == 0xF9000000 and (w2 & 0x1F) == source:
+                offset = ((w2 >> 10) & 0xFFF) * 8
+                candidates[offset] = candidates.get(offset, 0) + 1
+                break
+
+    # Only a single, unambiguous offset is trusted.
+    if len(candidates) != 1:
+        return 0
+    offset, count = next(iter(candidates.items()))
+    return offset if count >= 1 else 0
+
+
 # ---------------------------------------------------------------------------
 # What to resolve
 # ---------------------------------------------------------------------------
@@ -695,14 +844,32 @@ def _entity_seam_fields(image: ElfImage) -> list[dict]:
     recovered by this pass and must not be guessed.
     """
     verified = {v["name"]: v for v in verify_known_offsets(image)}
+    level_offset = find_level_entity_manager_offset(image)
     fields = []
     for name, meaning in ENTITY_SEAM_FIELDS:
         offset = None
+        if name == "levelEntityListOffset" and level_offset:
+            offset = level_offset
         for verified_name, field_name in _VERIFIED_TO_FIELD.items():
             if field_name == name and verified.get(verified_name, {}).get("verified"):
                 offset = verified[verified_name]["offset"]
         fields.append({"name": name, "meaning": meaning, "offset": offset})
     return fields
+
+
+def _actor_manager_report(image: ElfImage) -> dict:
+    """The recovered Level -> ActorManager chain, for inspection."""
+    ctor = find_actor_manager_constructor(image)
+    level_offset = find_level_entity_manager_offset(image)
+    return {
+        "constructor": ctor,
+        "level_entity_manager_offset": level_offset,
+        "vector_offset_in_manager": ACTOR_MANAGER_VECTOR_OFFSET,
+        "note": (
+            "Two-step walk: level + level_entity_manager_offset -> ActorManager*, "
+            "then vector_offset_in_manager -> {begin, end, cap}."
+        ),
+    }
 
 
 def build_report(image: ElfImage, version: str, so_sha256: str, so_bytes: int) -> dict:
@@ -715,6 +882,7 @@ def build_report(image: ElfImage, version: str, so_sha256: str, so_bytes: int) -
         "rtti_slots_by_needle": [],
         "signatures": [],
         "entity_seam_verification": verify_known_offsets(image),
+        "actor_manager": _actor_manager_report(image),
         "entity_seam_offsets": {
             "resolved": False,
             "reason": (

@@ -271,6 +271,135 @@ static void test_offset_map() {
                          std::strlen(garbage)) == nullptr);
 }
 
+// The entity-list walk: build a synthetic Level -> ActorManager -> vector<Actor*>
+// graph in C++ and drive gbr_entity_walk / gbr_entity_position over the ABI. This
+// is what proves the two-step chain and the pointer layout agree across the
+// language boundary.
+static void test_entity_walk() {
+  const char *kJson =
+      "{"
+      "\"version\":\"26.60\","
+      "\"so_sha256\":\"b6ffe00817117b03a518b4c9254dcbbb821ad53f276d179c67021226ca221a80\","
+      "\"entity_seam_offsets\":{\"resolved\":true,\"fields\":["
+      "{\"name\":\"levelEntityListOffset\",\"offset\":992},"
+      "{\"name\":\"entityPositionOffset\",\"offset\":560}"
+      "]}"
+      "}";
+  GbrOffsetMap *map =
+      gbr_offsets_load(reinterpret_cast<const std::uint8_t *>(kJson), std::strlen(kJson));
+  CHECK(map != nullptr);
+  if (map == nullptr) {
+    return;
+  }
+  CHECK_EQ(gbr_offsets_entity_walk_ready(map), 1u);
+
+  // Two actors, each with a Vec3 at +0x230.
+  struct ActorStorage {
+    std::uint8_t bytes[0x230 + 12];
+  };
+  ActorStorage a0{}, a1{};
+  auto write_pos = [](ActorStorage &a, float x, float y, float z) {
+    std::memcpy(a.bytes + 0x230, &x, 4);
+    std::memcpy(a.bytes + 0x230 + 4, &y, 4);
+    std::memcpy(a.bytes + 0x230 + 8, &z, 4);
+  };
+  write_pos(a0, 1.0f, 2.0f, 3.0f);
+  write_pos(a1, 4.0f, 5.0f, 6.0f);
+
+  // The vector: {begin, end, cap} of Actor*.
+  const std::uint8_t *entries[2] = {a0.bytes, a1.bytes};
+  struct Manager {
+    std::uint8_t pad[0x8];
+    const std::uint8_t **begin;
+    const std::uint8_t **end;
+    const std::uint8_t **cap;
+  } manager{};
+  manager.begin = entries;
+  manager.end = entries + 2;
+  manager.cap = entries + 2;
+
+  // The Level: the manager pointer at +0x3e0.
+  struct Level {
+    std::uint8_t bytes[0x3e0 + 8];
+  } level{};
+  auto *manager_ptr = reinterpret_cast<const std::uint8_t *>(&manager);
+  std::memcpy(level.bytes + 0x3e0, &manager_ptr, 8);
+
+  const std::uint8_t *actors[8] = {nullptr};
+  const int n = gbr_entity_walk(map, level.bytes, actors, 8);
+  CHECK_EQ(n, 2);
+  if (n == 2) {
+    float position[3] = {0, 0, 0};
+    CHECK_EQ(gbr_entity_position(map, actors[0], position), 0);
+    CHECK(position[0] == 1.0f && position[1] == 2.0f && position[2] == 3.0f);
+    CHECK_EQ(gbr_entity_position(map, actors[1], position), 0);
+    CHECK(position[0] == 4.0f && position[1] == 5.0f && position[2] == 6.0f);
+  }
+
+  // Null arguments are refused.
+  CHECK_EQ(gbr_entity_walk(nullptr, level.bytes, actors, 8), -1);
+  CHECK_EQ(gbr_entity_walk(map, nullptr, actors, 8), -1);
+  CHECK_EQ(gbr_entity_position(map, nullptr, nullptr), -1);
+
+  // A null Level pointer is refused, not dereferenced.
+  CHECK_EQ(gbr_entity_walk(map, nullptr, actors, 8), -1);
+
+  gbr_offsets_free(map);
+
+  // A map without the entity seam is not walk-ready.
+  const char *no_seam = "{\"version\":\"x\",\"so_sha256\":\"y\"}";
+  GbrOffsetMap *bare =
+      gbr_offsets_load(reinterpret_cast<const std::uint8_t *>(no_seam), std::strlen(no_seam));
+  CHECK(bare != nullptr);
+  if (bare != nullptr) {
+    CHECK_EQ(gbr_offsets_entity_walk_ready(bare), 0u);
+    // The walk then returns 0 rather than touching memory.
+    CHECK_EQ(gbr_entity_walk(bare, level.bytes, actors, 8), 0);
+    gbr_offsets_free(bare);
+  }
+}
+
+// The fallback: with no map at all (the fail-closed default), every entry point
+// answers the "not available" value instead of dereferencing anything. This is
+// what the mod relies on when a build has no verified offsets.
+static void test_fallback_is_safe() {
+  // A null map is refused by every entity entry point.
+  const std::uint8_t dummy[16] = {0};
+  const std::uint8_t *actors[4] = {nullptr};
+  float position[3] = {0, 0, 0};
+  CHECK_EQ(gbr_offsets_entity_walk_ready(nullptr), 0u);
+  CHECK_EQ(gbr_offsets_entity_seam_complete(nullptr), 0u);
+  CHECK_EQ(gbr_entity_walk(nullptr, dummy, actors, 4), -1);
+  CHECK_EQ(gbr_entity_position(nullptr, dummy, position), -1);
+
+  // A malformed document loads as null, and the caller simply has no map.
+  const char *bad = "not json";
+  CHECK(gbr_offsets_load(reinterpret_cast<const std::uint8_t *>(bad), std::strlen(bad)) ==
+        nullptr);
+
+  // A map for a different build fails verification, so the mod keeps the
+  // fallback rather than using stale offsets.
+  const char *kJson =
+      "{"
+      "\"version\":\"26.60\","
+      "\"so_sha256\":\"b6ffe00817117b03a518b4c9254dcbbb821ad53f276d179c67021226ca221a80\","
+      "\"entity_seam_offsets\":{\"fields\":["
+      "{\"name\":\"levelEntityListOffset\",\"offset\":992},"
+      "{\"name\":\"entityPositionOffset\",\"offset\":560}"
+      "]}"
+      "}";
+  GbrOffsetMap *map =
+      gbr_offsets_load(reinterpret_cast<const std::uint8_t *>(kJson), std::strlen(kJson));
+  CHECK(map != nullptr);
+  if (map != nullptr) {
+    const char *wrong = "deadbeef";
+    CHECK_EQ(gbr_offsets_verify_build(map, reinterpret_cast<const std::uint8_t *>(wrong),
+                                      std::strlen(wrong)),
+             0u);
+    gbr_offsets_free(map);
+  }
+}
+
 int main() {
   test_version();
   test_mesh_lone_block();
@@ -282,6 +411,8 @@ int main() {
   test_pipeline();
   test_world_layers();
   test_offset_map();
+  test_entity_walk();
+  test_fallback_is_safe();
 
   if (g_failures == 0) {
     std::printf("ffi_smoke: all checks passed\n");

@@ -134,14 +134,20 @@
       }
     }
   ],
+  "actor_manager": {
+    "constructor": 263716672,
+    "level_entity_manager_offset": 984,
+    "vector_offset_in_manager": 8,
+    "note": "Two-step walk: level + level_entity_manager_offset -> ActorManager*, then vector_offset_in_manager -> {begin, end, cap}."
+  },
   "entity_seam_offsets": {
     "resolved": false,
-    "reason": "Field offsets inside a live Level/Actor are not revealed by any signature or RTTI name; they require disassembling the accessors. Not fabricated - see docs/agent-notes/signature-derivation.md.",
+    "reason": "The Actor position/rotation offsets are verified per build (see entity_seam_verification) and filled in below. The two that remain null - levelEntityListOffset and entityRuntimeIdOffset - are not recovered: they need a deeper disassembly pass, and a guessed value would fault the game thread. See docs/agent-notes/signature-derivation.md.",
     "fields": [
       {
         "name": "levelEntityListOffset",
         "meaning": "the Level/Dimension entity-list vector offset",
-        "offset": null
+        "offset": 984
       },
       {
         "name": "entityRuntimeIdOffset",

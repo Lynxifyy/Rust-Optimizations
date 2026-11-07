@@ -72,8 +72,33 @@ per build** and carry a value; two remain `null`.
 |---|---|---|
 | `entityPositionOffset` | **verified = `0x230`** | member-address getter + float-vec3 group |
 | `entityRotationOffset` | **verified = `0x238`** | member-address getter + float-vec3 group |
-| `levelEntityListOffset` | **null** | not recovered (needs a deeper pass) |
+| `levelEntityListOffset` | **recovered** (`0x3e0` on 26.60/26.62, `0x3d8` on 26.52) | constructor store trace (see below) |
 | `entityRuntimeIdOffset` | **null** | not recovered (needs a deeper pass) |
+
+`levelEntityListOffset` is **not** a struct field on the `Level`; it is the offset
+of the `ActorManager*` member. The actor list is the `{begin, end, cap}` vector at
+`ActorManager + 0x8`, so the walk is two steps:
+
+```text
+level + level_entity_manager_offset  ->  ActorManager*  ->  +0x8  ->  {begin, end}
+```
+
+It is recovered deterministically, with no hardcoded address:
+
+1. resolve `ActorManager` by RTTI name (`12ActorManager`);
+2. find its constructor: the function that stores the vtable address point
+   (`vptr`) into `this`;
+3. find the call sites of that constructor, follow the register moved into `x0`,
+   and read the `str xN, [xBase, #off]` that lands the pointer;
+4. trust the result only when exactly one offset is stored by the call sites.
+
+On 26.60 the trace runs through the `Level` constructor at `0x10afe58c` (which
+stores the Level vptr `0x13e0a0f8`), and the store is `str x20, [x19, #0x3e0]` -
+one call site, one offset. Cross-checked: a second, independent scan for
+`[x, #0x3e0] -> read +8 and +0x10` (the vector walk) finds the same chain in
+non-stack sites, one of them inside the Level itself. The `ActorManager` ctor also
+zero-initializes its vector at `+8/+0x10/+0x18`, confirming the libc++ layout
+`EntityListWalk` expects.
 
 ### How the two are verified
 
@@ -96,22 +121,14 @@ preloader hardcodes in `GameLocalPlayer.cpp`.
 
 ### What is still not recovered
 
-`levelEntityListOffset` and `entityRuntimeIdOffset` are **null**, not guessed.
-Notes for the next pass (also in issue #4):
+`entityRuntimeIdOffset` is **null**, not guessed. Notes for the next pass (also in
+issue #4):
 
 - `12ActorManager` and `5Level` **are** RTTI-resolvable (`resolveVtableFunction`
   finds them), contrary to an earlier assumption that the entity manager had no
   RTTI name. `ActorManager`'s vtable address point is `0x13d6eda8` on 26.60, and
   its slots 0/1/2 are member-address getters returning `this + 0x90 / 0xe8 /
-  0x140` - one of those containers holds the actor vector. Slot 10 iterates a
-  `{begin, end}` vector at `+8`/`+0x10` of some object, so the container layout is
-  the libc++ vector `EntityListWalk` already expects.
-- The hard part is the **Level -> ActorManager link**: on 26.60 the ActorManager
-  is constructed at `0x103b1884` (called from `0x10aff638`), but the store of the
-  resulting pointer into the Level is buried in a very large constructor. Pinning
-  the exact Level member offset needs a focused pass on that constructor (or on
-  `Level`'s pointer-member getters, of which `0x130`, `0x150`, `0x2e0` and
-  `0x350` are candidates).
+  0x140`; slot 10 iterates a `{begin, end}` vector at `+8`/`+0x10`.
 - `entityRuntimeIdOffset` is a field of `Actor`; the Actor vtable's slots resolve
   to pure-virtual interface bases, so the offset has to come from a function that
   reads the runtime id (e.g. the packet handlers), not from a vtable getter.
