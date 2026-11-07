@@ -408,6 +408,74 @@ static void test_fallback_is_safe() {
   }
 }
 
+// The dynamic probe: build a synthetic Actor graph where only ONE candidate
+// offset points at a real Level, and confirm the probe picks it and refuses the
+// garbage one without faulting. This is the decision procedure the live hook
+// relies on.
+static void test_probe_actor_level() {
+  const std::uint64_t kLevelManagerOffset = 0x3e0;
+  const std::uint64_t kGoodOffset = 0x1f0;  // points at the Level
+  const std::uint64_t kBadOffset = 0x20;    // points at a small integer (garbage)
+
+  // The actor-vector storage: two real pointers, and a {begin, end, cap} view.
+  const std::uint8_t *entries[2] = {reinterpret_cast<const std::uint8_t *>(0x1000),
+                                    reinterpret_cast<const std::uint8_t *>(0x2000)};
+  struct Manager {
+    std::uint8_t pad[0x8];
+    const std::uint8_t **begin;
+    const std::uint8_t **end;
+    const std::uint8_t **cap;
+  } manager{};
+  manager.begin = entries;
+  manager.end = entries + 2;
+  manager.cap = entries + 2;
+
+  // The Level: the manager pointer at +0x3e0.
+  struct Level {
+    std::uint8_t bytes[0x3e0 + 8];
+  } level{};
+  auto *manager_ptr = reinterpret_cast<const std::uint8_t *>(&manager);
+  std::memcpy(level.bytes + kLevelManagerOffset, &manager_ptr, 8);
+
+  // The actor: a real Level* at +0x1f0, and a small non-pointer at +0x20.
+  struct Actor {
+    std::uint8_t bytes[0x1f0 + 8];
+  } actor{};
+  auto *level_ptr = reinterpret_cast<const std::uint8_t *>(&level);
+  std::memcpy(actor.bytes + kGoodOffset, &level_ptr, 8);
+  std::uint64_t small = 0x1234;
+  std::memcpy(actor.bytes + kBadOffset, &small, 8);
+
+  const std::uint64_t offsets[2] = {kBadOffset, kGoodOffset};
+  GbrProbeResult results[2] = {};
+  const std::uint64_t decided =
+      gbr_probe_actor_level(actor.bytes, kLevelManagerOffset, offsets, 2, results, 2);
+
+  // The probe must pick the good offset and reject the bad one.
+  CHECK_EQ(decided, kGoodOffset);
+  CHECK_EQ(results[0].offset, kBadOffset);
+  CHECK(results[0].rejection != GBR_PROBE_OK);
+  CHECK_EQ(results[0].entities, std::int64_t{-1});
+  CHECK_EQ(results[1].offset, kGoodOffset);
+  CHECK_EQ(results[1].rejection, static_cast<std::uint32_t>(GBR_PROBE_OK));
+  CHECK_EQ(results[1].entities, std::int64_t{2});
+  CHECK_EQ(results[1].begin, reinterpret_cast<std::uint64_t>(entries));
+  CHECK_EQ(results[1].end, reinterpret_cast<std::uint64_t>(entries + 2));
+
+  // A null actor is refused, not dereferenced.
+  CHECK_EQ(gbr_probe_actor_level(nullptr, kLevelManagerOffset, offsets, 2, results, 2), 0u);
+
+  // A garbage (unmapped) actor pointer must not fault: process_vm_readv reports
+  // it, so the probe returns 0.
+  const std::uint8_t *unmapped = reinterpret_cast<const std::uint8_t *>(0x1000);
+  CHECK_EQ(gbr_probe_actor_level(unmapped, kLevelManagerOffset, offsets, 2, results, 2), 0u);
+
+  // The single-pointer reader is fault-safe too.
+  CHECK_EQ(gbr_probe_read_pointer(0), 0u);
+  CHECK_EQ(gbr_probe_read_pointer(0x1000), 0u);  // unmapped
+  CHECK_EQ(gbr_probe_read_pointer(reinterpret_cast<std::uint64_t>(&small)), small);
+}
+
 int main() {
   test_version();
   test_mesh_lone_block();
@@ -421,6 +489,7 @@ int main() {
   test_offset_map();
   test_entity_walk();
   test_fallback_is_safe();
+  test_probe_actor_level();
 
   if (g_failures == 0) {
     std::printf("ffi_smoke: all checks passed\n");

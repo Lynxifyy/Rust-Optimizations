@@ -46,6 +46,8 @@
 #include <pl/Config.hpp>
 #include <pl/Logger.hpp>
 #include <pl/Mod.hpp>
+#include <pl/memory/Hook.hpp>
+#include <pl/memory/Vtable.hpp>
 
 #include "glowberry_rust_abi.h"
 
@@ -66,6 +68,8 @@ struct GlowberryRustConfig {
   int world_size = 64;
   /// Run the startup workload through the pipeline.
   bool run_workload = true;
+  /// Install the slot-31 detour and probe for the Actor->Level offset.
+  bool probe_actor_level = true;
   /// Use a per-build offset map when one is present and verified.
   bool use_offset_map = true;
   /// The detected game version, selecting `offsets_<version>.json`. Empty means
@@ -78,6 +82,18 @@ struct GlowberryRustConfig {
 
 /// The live offset map, when one was loaded and verified.
 GbrOffsetMap *g_offset_map = nullptr;
+
+/// The `Level` -> `ActorManager*` offset for this build, set from the map.
+std::uint64_t g_levelManagerOffset = 0;
+
+/// The resolved slot-31 address, for diagnostics. 0 until installed.
+std::atomic<std::uintptr_t> g_probeSlot{0};
+
+/// The live local player, latched by the slot-31 detour. 0 until the game calls it.
+std::atomic<std::uintptr_t> g_localPlayer{0};
+
+/// The original slot-31 function, so the detour stays a passthrough.
+void *(*g_origGetLocalPlayer)(void *) = nullptr;
 
 /// The mod's root directory, set at load, where `offsets_<version>.json` lives.
 std::string g_mod_root;
@@ -317,6 +333,12 @@ GbrOffsetMap *load_offset_map(const std::string &mod_root, const GlowberryRustCo
   if (gbr_offsets_entity_seam_complete(map) == 0) {
     log.info("offset map {} does not carry recovered entity-seam offsets yet", version);
   }
+  // Cache the recovered Level -> ActorManager offset for the probe.
+  {
+    const char *field = "levelEntityListOffset";
+    g_levelManagerOffset = gbr_offsets_entity_field(
+        map, reinterpret_cast<const std::uint8_t *>(field), std::strlen(field));
+  }
   if (gbr_offsets_entity_walk_ready(map) != 0) {
     log.info("entity-list walk is available: level -> ActorManager -> vector<Actor*>");
   } else {
@@ -324,6 +346,123 @@ GbrOffsetMap *load_offset_map(const std::string &mod_root, const GlowberryRustCo
   }
   report_offset_map(map, log);
   return map;
+}
+
+
+// --- The Actor -> Level probe -------------------------------------------------
+//
+// Slot 31 returns a LocalPlayer* (an Actor*), and static analysis could not settle
+// which Actor member holds the Level* (two candidates conflicted). The honest way
+// to decide is to read the live object. The read is fault-safe: the Rust core
+// uses process_vm_readv, which reports an unmapped address instead of faulting,
+// so a garbage candidate is rejected rather than crashing the game.
+//
+// The candidate offsets come from the disassembly pass:
+//   - 0x20  : the Actor constructor stores its Level& argument here;
+//   - 0x1f0 : the Mob constructor stores it here.
+// Exactly one should validate as a Level; if both or neither do, the probe
+// refuses and nothing is used.
+
+constexpr std::uint64_t kActorLevelCandidates[] = {0x20, 0x1f0};
+
+/// The slot-31 detour: pure passthrough. It never touches the arguments or the
+/// return value (the game strips symbols, so the real signature is unknown), it
+/// only latches the pointer the game just returned.
+void *HookGetLocalPlayer(void *self) {
+  void *localPlayer = g_origGetLocalPlayer ? g_origGetLocalPlayer(self) : nullptr;
+  if (localPlayer != nullptr) {
+    g_localPlayer.store(reinterpret_cast<std::uintptr_t>(localPlayer),
+                        std::memory_order_relaxed);
+  }
+  return localPlayer;
+}
+
+/// The offset the probe confirmed this session, or 0.
+std::uint64_t g_confirmedActorLevelOffset = 0;
+
+/// Runs the candidate probe against a live local player and logs the verdict.
+///
+/// Returns the confirmed offset, or 0 when the probe did not settle it.
+std::uint64_t probe_actor_level(std::uintptr_t localPlayer, std::uint64_t levelManagerOffset,
+                                pl::log::Logger &log) {
+  if (localPlayer == 0 || levelManagerOffset == 0) {
+    log.info("actor->level probe: no live local player yet");
+    return 0;
+  }
+
+  constexpr std::size_t kCount = sizeof(kActorLevelCandidates) / sizeof(std::uint64_t);
+  GbrProbeResult results[kCount] = {};
+  const std::uint64_t decided = gbr_probe_actor_level(
+      reinterpret_cast<const std::uint8_t *>(localPlayer), levelManagerOffset,
+      kActorLevelCandidates, static_cast<std::uint32_t>(kCount), results,
+      static_cast<std::uint32_t>(kCount));
+
+  for (std::size_t i = 0; i < kCount; ++i) {
+    const GbrProbeResult &r = results[i];
+    if (r.rejection == GBR_PROBE_OK) {
+      log.info("actor->level probe: candidate {:#x} VALID (level {:#x}, {} entities)",
+               r.offset, r.level, r.entities);
+    } else {
+      log.info("actor->level probe: candidate {:#x} rejected (code {}, level {:#x})",
+               r.offset, r.rejection, r.level);
+    }
+  }
+
+  if (decided == 0) {
+    log.warn("actor->level probe: no single candidate validated; offset stays unrecovered");
+    return 0;
+  }
+  log.info("actor->level probe: confirmed Actor+{:#x} -> Level", decided);
+  return decided;
+}
+
+/// Installs the slot-31 detour (once) and probes for the Actor->Level offset.
+void init_actor_level_probe(const GlowberryRustConfig &cfg, pl::log::Logger &log) {
+  if (!cfg.probe_actor_level) {
+    log.info("actor->level probe disabled by config");
+    return;
+  }
+
+  const std::uintptr_t slot =
+      pl::memory::resolveVtableFunction("14ClientInstance", 31, "libminecraftpe.so");
+  if (slot == 0) {
+    log.warn("actor->level probe: ClientInstance slot 31 unresolved; probe skipped");
+    return;
+  }
+  if (pl::memory::hook(reinterpret_cast<pl::memory::FuncPtr>(slot),
+                       reinterpret_cast<pl::memory::FuncPtr>(HookGetLocalPlayer),
+                       reinterpret_cast<pl::memory::FuncPtr *>(&g_origGetLocalPlayer),
+                       pl::memory::HookPriority::Normal,
+                       "ClientInstance::getLocalPlayer (probe)") != 0) {
+    log.warn("actor->level probe: slot-31 hook install failed; probe skipped");
+    return;
+  }
+  log.info("actor->level probe: slot-31 detour installed; awaiting a live local player");
+  g_probeSlot.store(slot, std::memory_order_relaxed);
+}
+
+/// Called once the local player has been seen: runs the probe and, on success,
+/// logs that the entity walk is now usable. Kept separate so `enable` can retry
+/// the probe after the world has loaded.
+void maybe_probe_now(pl::log::Logger &log) {
+  if (g_confirmedActorLevelOffset != 0) {
+    return;
+  }
+  if (g_offset_map == nullptr) {
+    return;
+  }
+  const std::uintptr_t localPlayer = g_localPlayer.load(std::memory_order_relaxed);
+  if (localPlayer == 0) {
+    return;
+  }
+  // The level-manager offset comes from the map (recovered and verified); it is
+  // cached in `g_levelManagerOffset` when the map loads.
+  const std::uint64_t offset =
+      probe_actor_level(localPlayer, g_levelManagerOffset, log);
+  if (offset != 0) {
+    g_confirmedActorLevelOffset = offset;
+    log.info("actor->level offset confirmed: {:#x}", offset);
+  }
 }
 
 } // namespace
@@ -360,6 +499,10 @@ template <> struct Schema<GlowberryRustConfig> {
     if (name == "run_workload") {
       return {"Run workload", "Mesh a world through the pipeline at startup.", std::nullopt,
               std::nullopt, false};
+    }
+    if (name == "probe_actor_level") {
+      return {"Probe actor level", "Hook slot 31 and probe for the Actor->Level offset.",
+              std::nullopt, std::nullopt, false};
     }
     if (name == "use_offset_map") {
       return {"Use offset map", "Use a per-build offset map when present and verified.",
@@ -420,6 +563,10 @@ public:
       log().error("startup workload failed; disabling this session");
       return false;
     }
+
+    // Install the slot-31 detour and, once a live local player appears, probe for
+    // the Actor->Level offset. Nothing is used until the probe confirms it.
+    init_actor_level_probe(cfg, log());
     return true;
   }
 
@@ -429,6 +576,9 @@ public:
       return true;
     }
     log().info("enabled");
+    // A world is usually loaded by the time enable runs, so the probe has a live
+    // local player to read. It is idempotent: it does nothing once confirmed.
+    maybe_probe_now(log());
     return true;
   }
 
@@ -445,6 +595,12 @@ public:
     if (g_offset_map != nullptr) {
       gbr_offsets_free(g_offset_map);
       g_offset_map = nullptr;
+    }
+    const std::uintptr_t probe_slot = g_probeSlot.load(std::memory_order_relaxed);
+    if (probe_slot != 0) {
+      pl::memory::unhook(reinterpret_cast<pl::memory::FuncPtr>(probe_slot),
+                         reinterpret_cast<pl::memory::FuncPtr>(HookGetLocalPlayer));
+      g_probeSlot.store(0, std::memory_order_relaxed);
     }
     log().info("unloaded");
     return true;
