@@ -785,6 +785,44 @@ def find_level_entity_manager_offset(image: ElfImage) -> int:
     return offset if count >= 1 else 0
 
 
+# --- Actor -> Level -----------------------------------------------------------
+#
+# To reach the entity list from the local player (the pointer ClientInstance slot
+# 31 returns, which is an `Actor*`), we need the `Actor` member that holds the
+# `Level*`. Two independent signals pin it:
+#
+#   1. the `Actor` constructor stores its `Level&` argument (in `x1`) at
+#      `str x1, [this, #off]`;
+#   2. some function reads `[actor, #off]` and then `[that, #0x3e0]` - the Level's
+#      ActorManager member.
+#
+# The offset is accepted only when both agree. On 26.60 that is `0x20`.
+
+def find_actor_level_offset(image: ElfImage, level_offset: int) -> int:
+    """The `Actor` member holding the `Level*`, or 0 (unrecovered).
+
+    **Not recovered.** This returns 0 deliberately. The obvious signals do not
+    agree, and a wrong value here is a fault on the game thread:
+
+    - The `Actor` constructor at 26.60 stores its `Level&` argument (x1) at
+      `Actor+0x20`; the `Mob` constructor stores x1 at `Actor+0x1f0`. The two
+      conflict, and neither has been confirmed against a live object.
+    - A displacement-only correlation (`[x,#off]` then `[.,+level_offset]`) is
+      unsound: `+0x20` and `+0x1f0` are common offsets on many unrelated types,
+      and none of the correlated sites uses the same base register with the known
+      `Actor` position field (`+0x230`), which is the check that would prove the
+      base really is an `Actor`.
+
+    Recovering it needs a live-object confirmation (or a `getLevel()`-style
+    accessor resolved by name), not a static correlation. See issue #4.
+
+    `level_offset` is the recovered `Level` -> `ActorManager*` member for this
+    build (it differs per build).
+    """
+    del image, level_offset
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # What to resolve
 # ---------------------------------------------------------------------------
@@ -822,6 +860,7 @@ SIGNATURE_TARGETS: list[tuple[str, str, str]] = [
 
 # The EntitySeamOffsets fields, reported as unrecovered with the reason.
 ENTITY_SEAM_FIELDS = [
+    ("actorLevelOffset", "the Actor -> Level* member offset (local player to level)"),
     ("levelEntityListOffset", "the Level/Dimension entity-list vector offset"),
     ("entityRuntimeIdOffset", "the runtime id offset inside an Actor"),
     ("entityPositionOffset", "the position offset inside an Actor"),
@@ -848,6 +887,8 @@ def _entity_seam_fields(image: ElfImage) -> list[dict]:
     fields = []
     for name, meaning in ENTITY_SEAM_FIELDS:
         offset = None
+        if name == "actorLevelOffset":
+            offset = find_actor_level_offset(image, level_offset) or None
         if name == "levelEntityListOffset" and level_offset:
             offset = level_offset
         for verified_name, field_name in _VERIFIED_TO_FIELD.items():
@@ -864,6 +905,7 @@ def _actor_manager_report(image: ElfImage) -> dict:
     return {
         "constructor": ctor,
         "level_entity_manager_offset": level_offset,
+        "actor_level_offset": find_actor_level_offset(image, level_offset),
         "vector_offset_in_manager": ACTOR_MANAGER_VECTOR_OFFSET,
         "note": (
             "Two-step walk: level + level_entity_manager_offset -> ActorManager*, "
@@ -966,6 +1008,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  SIG {entry['name']}: {entry['status']} "
             f"({entry['match_count']} match(es))"
         )
+    am = report.get("actor_manager", {})
+    print(
+        f"  CHAIN actor+{am.get('actor_level_offset', 0):#x} -> level+"
+        f"{am.get('level_entity_manager_offset', 0):#x} -> manager+"
+        f"{am.get('vector_offset_in_manager', 0):#x}"
+    )
     for entry in report["entity_seam_verification"]:
         mark = "VERIFIED" if entry["verified"] else "NOT VERIFIED"
         print(
