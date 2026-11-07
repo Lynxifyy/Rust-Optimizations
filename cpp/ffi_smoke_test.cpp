@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -207,6 +208,69 @@ static void test_world_layers() {
   gbr_mesh_free(empty);
 }
 
+// The offset-map path: parse a report, look up a slot, gate on the build id.
+static void test_offset_map() {
+  // The shape tools/extract_offsets.py emits.
+  static const char *kJson =
+      "{"
+      "\"version\":\"26.60\","
+      "\"so_bytes\":342231392,"
+      "\"so_sha256\":\"b6ffe00817117b03a518b4c9254dcbbb821ad53f276d179c67021226ca221a80\","
+      "\"rtti_slots\":["
+      "{\"type_name\":\"14ClientInstance\",\"slot\":31,\"function_vaddr\":163051024},"
+      "{\"type_name\":\"18LivePlayerRenderer\",\"slot\":17,\"function_vaddr\":161642012}"
+      "],"
+      "\"entity_seam_offsets\":{\"resolved\":false,\"fields\":["
+      "{\"name\":\"levelEntityListOffset\",\"offset\":null}"
+      "]}"
+      "}";
+
+  GbrOffsetMap *map =
+      gbr_offsets_load(reinterpret_cast<const std::uint8_t *>(kJson), std::strlen(kJson));
+  CHECK(map != nullptr);
+  if (map == nullptr) {
+    return;
+  }
+
+  const char *type_name = "14ClientInstance";
+  CHECK_EQ(
+      gbr_offsets_slot(map, reinterpret_cast<const std::uint8_t *>(type_name),
+                       std::strlen(type_name), 31),
+      std::uint64_t{163051024});
+  // An absent slot resolves to 0, never a fabricated address.
+  CHECK_EQ(gbr_offsets_slot(map, reinterpret_cast<const std::uint8_t *>(type_name),
+                            std::strlen(type_name), 999),
+           std::uint64_t{0});
+
+  // The build gate: a matching hash passes, a different one fails.
+  const char *good =
+      "b6ffe00817117b03a518b4c9254dcbbb821ad53f276d179c67021226ca221a80";
+  const char *bad = "deadbeef";
+  CHECK_EQ(gbr_offsets_verify_build(map, reinterpret_cast<const std::uint8_t *>(good),
+                                    std::strlen(good)),
+           1u);
+  CHECK_EQ(gbr_offsets_verify_build(map, reinterpret_cast<const std::uint8_t *>(bad),
+                                    std::strlen(bad)),
+           0u);
+
+  // The entity seam is not recovered in this map.
+  CHECK_EQ(gbr_offsets_entity_seam_complete(map), 0u);
+
+  char version[32] = {0};
+  const std::size_t n =
+      gbr_offsets_version(map, reinterpret_cast<std::uint8_t *>(version), sizeof(version));
+  CHECK_EQ(n, std::strlen("26.60"));
+  CHECK(std::strcmp(version, "26.60") == 0);
+
+  gbr_offsets_free(map);
+  gbr_offsets_free(nullptr); // null is safe
+
+  // A malformed document is a null, not a crash.
+  const char *garbage = "not json at all";
+  CHECK(gbr_offsets_load(reinterpret_cast<const std::uint8_t *>(garbage),
+                         std::strlen(garbage)) == nullptr);
+}
+
 int main() {
   test_version();
   test_mesh_lone_block();
@@ -217,6 +281,7 @@ int main() {
   test_frustum_cull();
   test_pipeline();
   test_world_layers();
+  test_offset_map();
 
   if (g_failures == 0) {
     std::printf("ffi_smoke: all checks passed\n");

@@ -35,7 +35,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -62,7 +66,21 @@ struct GlowberryRustConfig {
   int world_size = 64;
   /// Run the startup workload through the pipeline.
   bool run_workload = true;
+  /// Use a per-build offset map when one is present and verified.
+  bool use_offset_map = true;
+  /// The detected game version, selecting `offsets_<version>.json`. Empty means
+  /// no map is looked for.
+  std::string game_version;
+  /// The running `libminecraftpe.so` sha256 (hex), for the map's fail-closed
+  /// build check. Empty means the map is loaded but not verified.
+  std::string minecraftpe_sha256;
 };
+
+/// The live offset map, when one was loaded and verified.
+GbrOffsetMap *g_offset_map = nullptr;
+
+/// The mod's root directory, set at load, where `offsets_<version>.json` lives.
+std::string g_mod_root;
 
 /// The default flat world, in the same shape `FlatWorldGenerator` builds:
 /// one bedrock, two dirt, one grass.
@@ -208,6 +226,101 @@ bool run_workload(const GlowberryRustConfig &cfg, pl::log::Logger &log) {
   return complete;
 }
 
+
+/// Logs the seams a map resolves, so a session's log shows what the map provides.
+void report_offset_map(const GbrOffsetMap *map, pl::log::Logger &log) {
+  struct Target {
+    const char *type_name;
+    std::uint32_t slot;
+    const char *meaning;
+  };
+  const Target targets[] = {
+      {"14ClientInstance", 31, "getLocalPlayer"},
+      {"18LivePlayerRenderer", 17, "player render"},
+      {"20ClientNetworkHandler", 40, "player-join packet"},
+  };
+  for (const auto &target : targets) {
+    const std::uint64_t address =
+        gbr_offsets_slot(map, reinterpret_cast<const std::uint8_t *>(target.type_name),
+                         std::strlen(target.type_name), target.slot);
+    if (address != 0) {
+      log.info("  {} slot {} ({}) -> {:#x}", target.type_name, target.slot, target.meaning,
+               address);
+    } else {
+      log.info("  {} slot {} ({}) -> unresolved", target.type_name, target.slot, target.meaning);
+    }
+  }
+}
+
+/// Loads a per-build offset map for the configured game version, if present and
+/// valid.
+///
+/// The map is optional by design. It lives beside the mod as
+/// `offsets_<version>.json` (produced by `tools/extract_offsets.py`); when it is
+/// absent, unparseable, or describes a different `libminecraftpe.so` than the
+/// running one, this returns null and the caller keeps the fallback. A wrong map
+/// is a fault on the game thread, so the gate is strict.
+GbrOffsetMap *load_offset_map(const std::string &mod_root, const GlowberryRustConfig &cfg,
+                              pl::log::Logger &log) {
+  if (!cfg.use_offset_map) {
+    log.info("offset map disabled by config; using the fallback");
+    return nullptr;
+  }
+  if (cfg.game_version.empty()) {
+    log.info("no game version configured; using the fallback");
+    return nullptr;
+  }
+
+  const std::string file_name = "offsets_" + cfg.game_version + ".json";
+  const std::filesystem::path path = std::filesystem::path(mod_root) / file_name;
+
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    log.info("no offset map at {}; using the fallback", path.string());
+    return nullptr;
+  }
+  const std::string json((std::istreambuf_iterator<char>(stream)),
+                         std::istreambuf_iterator<char>());
+  if (json.empty()) {
+    log.warn("offset map {} is empty; using the fallback", path.string());
+    return nullptr;
+  }
+
+  GbrOffsetMap *map =
+      gbr_offsets_load(reinterpret_cast<const std::uint8_t *>(json.data()), json.size());
+  if (map == nullptr) {
+    log.warn("offset map {} did not parse; using the fallback", path.string());
+    return nullptr;
+  }
+
+  char version[32] = {0};
+  gbr_offsets_version(map, reinterpret_cast<std::uint8_t *>(version), sizeof(version));
+
+  // Fail closed on a build mismatch: only use the map when the running .so is
+  // the one it was derived from. An absent hash means "unverified", which is
+  // refused rather than trusted.
+  if (!cfg.minecraftpe_sha256.empty()) {
+    const std::uint32_t ok = gbr_offsets_verify_build(
+        map, reinterpret_cast<const std::uint8_t *>(cfg.minecraftpe_sha256.data()),
+        cfg.minecraftpe_sha256.size());
+    if (ok == 0) {
+      log.warn("offset map {} is for a different libminecraftpe.so; using the fallback", version);
+      gbr_offsets_free(map);
+      return nullptr;
+    }
+    log.info("offset map {} verified against the running libminecraftpe.so", version);
+  } else {
+    log.info("offset map {} loaded, but no libminecraftpe.so hash was supplied to verify it",
+             version);
+  }
+
+  if (gbr_offsets_entity_seam_complete(map) == 0) {
+    log.info("offset map {} does not carry recovered entity-seam offsets yet", version);
+  }
+  report_offset_map(map, log);
+  return map;
+}
+
 } // namespace
 
 namespace pl::config {
@@ -243,6 +356,18 @@ template <> struct Schema<GlowberryRustConfig> {
       return {"Run workload", "Mesh a world through the pipeline at startup.", std::nullopt,
               std::nullopt, false};
     }
+    if (name == "use_offset_map") {
+      return {"Use offset map", "Use a per-build offset map when present and verified.",
+              std::nullopt, std::nullopt, false};
+    }
+    if (name == "game_version") {
+      return {"Game version", "Selects offsets_<version>.json; empty disables the map.",
+              std::nullopt, std::nullopt, false};
+    }
+    if (name == "minecraftpe_sha256") {
+      return {"libminecraftpe sha256", "The running .so hash the map must match.",
+              std::nullopt, std::nullopt, false};
+    }
     return {"", "", std::nullopt, std::nullopt, false};
   }
 };
@@ -258,7 +383,8 @@ public:
     return mod;
   }
 
-  bool load(pl::mod::ModContext &) {
+  bool load(pl::mod::ModContext &context) {
+    g_mod_root = context.modRootPath().string();
     mConfig.emplace();
     if (!mConfig->load()) {
       log().warn("could not load config.json; using defaults for this session");
@@ -275,6 +401,15 @@ public:
       return false;
     }
     log().info("meshing pipeline ready ({} workers)", workers);
+
+    // The offset map is optional: load it when present and verified, and keep
+    // the fallback otherwise. Never fail the session over a missing map.
+    g_offset_map = load_offset_map(g_mod_root, cfg, log());
+    if (g_offset_map != nullptr) {
+      log().info("running with a per-build offset map");
+    } else {
+      log().info("running in fallback mode (FlatWorldGenerator meshing only)");
+    }
 
     if (cfg.run_workload && !run_workload(cfg, log())) {
       log().error("startup workload failed; disabling this session");
@@ -301,6 +436,10 @@ public:
     if (g_pipeline != nullptr) {
       gbr_pipeline_free(g_pipeline);
       g_pipeline = nullptr;
+    }
+    if (g_offset_map != nullptr) {
+      gbr_offsets_free(g_offset_map);
+      g_offset_map = nullptr;
     }
     log().info("unloaded");
     return true;

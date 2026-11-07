@@ -11,3 +11,11 @@
 
 # Agent scratch (memory, local notes)
 .openhands/
+
+# Downloaded APKs and extracted libminecraftpe.so files (hundreds of MB each).
+# Regenerate with tools/download_and_extract.py; never commit them.
+/work
+
+# Python bytecode from the tools
+__pycache__/
+*.pyc

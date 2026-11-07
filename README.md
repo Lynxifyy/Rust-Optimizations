@@ -72,6 +72,32 @@ recovered - that is the disassembly job the next PR is for. Until then the loop
 meshes the client's own world model, which is the one place the client itself
 owns voxel-shaped data.
 
+## Per-build offset maps (Phase 3)
+
+`tools/` turns a Minecraft Bedrock APK into a per-build offset map:
+
+- `tools/download_and_extract.py` resolves the mcpedl download chain, downloads
+  the APK and extracts `lib/arm64-v8a/libminecraftpe.so`.
+- `tools/extract_offsets.py` resolves RTTI vtable slots by name (the reliable
+  part - the slot index is stable across builds) and scans byte signatures
+  (the fragile part - it reports `unique`/`unmatched`/`ambiguous`).
+
+Maps for **26.52, 26.60 and 26.62** are committed under `offsets/`. Each
+resolves `ClientInstance` slot 31, `LivePlayerRenderer` slot 17 and
+`ClientNetworkHandler` slot 40, cross-checked two independent ways, with every
+address verified to be a real function entry point. See
+`docs/agent-notes/signature-derivation.md` for the method and its limits.
+
+At startup the mod loads `offsets_<game_version>.json` beside itself, **verifies
+its `so_sha256` against the running `libminecraftpe.so`**, and uses it only on a
+match. A missing, unparseable or mismatched map falls back to
+`FlatWorldGenerator` meshing - the fail-closed default. `src/offsets.rs` owns
+that logic and is host-tested.
+
+`entity_seam_offsets` is reported **unresolved on purpose**: those are field
+offsets inside a live `Level`/`Actor`, which need a disassembly pass, not a
+signature scan. They are not guessed.
+
 ## Layout
 
 ```
@@ -83,11 +109,20 @@ src/
   ring.rs       a bounded lock-free MPMC ring buffer
   pipeline.rs   the work loop: submit -> worker -> ring -> drain
   world.rs      a layered world description turned into a meshed volume
+  offsets.rs    per-build offset map loader (fail-closed)
   ffi.rs        the frozen C ABI (gbr_*)
 cpp/
   glowberry_rust_abi.h    the ABI header, single source of truth for both sides
   ffi_smoke_test.cpp      a C++ test that links the core and calls the ABI
   run_host_tests.sh       rustfmt + clippy + cargo test + the C++ smoke test
+tools/
+  download_and_extract.py APK download + libminecraftpe.so extraction
+  extract_offsets.py      RTTI/signature offset extraction
+  tests/                  unit tests for the pure logic
+offsets/
+  offsets_26_52.json      per-build offset maps
+  offsets_26_60.json
+  offsets_26_62.json
 mod/
   GlowberryRustMod.cpp    the preloader mod: lifecycle, config, load self-test
   CMakeLists.txt          cross-compiles the mod for arm64-v8a

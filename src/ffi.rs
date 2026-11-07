@@ -303,6 +303,115 @@ pub unsafe extern "C" fn gbr_mesh_world_layers(
     mesh_into_ffi(world.to_mesh())
 }
 
+/// The opaque offset-map handle.
+pub struct GbrOffsetMap {
+    inner: crate::offsets::OffsetMap,
+}
+
+/// Parses an offset map from JSON. Returns null on a parse error.
+///
+/// # Safety
+/// `json` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_offsets_load(json: *const u8, len: usize) -> *mut GbrOffsetMap {
+    if json.is_null() || len == 0 {
+        return std::ptr::null_mut();
+    }
+    let bytes = std::slice::from_raw_parts(json, len);
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return std::ptr::null_mut();
+    };
+    match crate::offsets::OffsetMap::parse(text) {
+        Ok(inner) => Box::into_raw(Box::new(GbrOffsetMap { inner })),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Frees an offset map. Null is accepted.
+///
+/// # Safety
+/// `map` must come from [`gbr_offsets_load`] and not be freed before.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_offsets_free(map: *mut GbrOffsetMap) {
+    if !map.is_null() {
+        drop(Box::from_raw(map));
+    }
+}
+
+/// The function address of a resolved slot, or 0 when the map has none.
+///
+/// # Safety
+/// `map` must be valid and `type_name` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_offsets_slot(
+    map: *const GbrOffsetMap,
+    type_name: *const u8,
+    len: usize,
+    slot: u32,
+) -> u64 {
+    if map.is_null() || type_name.is_null() {
+        return 0;
+    }
+    let bytes = std::slice::from_raw_parts(type_name, len);
+    let Ok(name) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    (*map).inner.slot(name, slot).unwrap_or(0)
+}
+
+/// 1 when the map describes the given `libminecraftpe.so` build id, else 0.
+///
+/// # Safety
+/// `map` must be valid and `sha256` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_offsets_verify_build(
+    map: *const GbrOffsetMap,
+    sha256: *const u8,
+    len: usize,
+) -> u32 {
+    if map.is_null() || sha256.is_null() {
+        return 0;
+    }
+    let bytes = std::slice::from_raw_parts(sha256, len);
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    u32::from((*map).inner.verify_build(text).is_ok())
+}
+
+/// 1 when the entity seam is fully recovered, else 0.
+///
+/// # Safety
+/// `map` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_offsets_entity_seam_complete(map: *const GbrOffsetMap) -> u32 {
+    if map.is_null() {
+        return 0;
+    }
+    u32::from((*map).inner.entity_seam_complete())
+}
+
+/// Copies the map's version string into `out` (NUL-terminated, truncated to
+/// `cap`). Returns the length written, excluding the NUL. 0 on a null argument.
+///
+/// # Safety
+/// `out` must point to `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_offsets_version(
+    map: *const GbrOffsetMap,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    if map.is_null() || out.is_null() || cap == 0 {
+        return 0;
+    }
+    let version = (*map).inner.version.as_bytes();
+    let n = version.len().min(cap - 1);
+    std::ptr::copy_nonoverlapping(version.as_ptr(), out, n);
+    *out.add(n) = 0;
+    n
+}
+
 /// The core version, packed as `0x00MMmmpp`.
 #[no_mangle]
 pub extern "C" fn gbr_version() -> u32 {
