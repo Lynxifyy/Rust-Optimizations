@@ -15,9 +15,11 @@
 // It is deliberately free of Android and preloader headers so it builds on any
 // host; `cpp/run_host_tests.sh` drives it.
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "glowberry_rust_abi.h"
@@ -60,8 +62,8 @@ static void set_block(std::vector<std::uint8_t> &blocks, std::uint32_t X,
 // --- Tests --------------------------------------------------------------------
 
 static void test_version() {
-  // 0x0001_00 = major 0, minor 1, patch 0.
-  CHECK_EQ(gbr_version(), 0x00000100u);
+  // 0x0002_00 = major 0, minor 2, patch 0.
+  CHECK_EQ(gbr_version(), 0x00000200u);
 }
 
 static void test_mesh_lone_block() {
@@ -141,10 +143,68 @@ static void test_frustum_cull() {
   };
   std::uint8_t visible[2] = {0, 0};
 
-  const std::uint32_t n =
-      gbr_frustum_cull(proj, boxes, visible, 2);
+  const std::uint32_t n = gbr_frustum_cull(proj, boxes, visible, 2);
   CHECK(n <= 2);
   CHECK_EQ(gbr_frustum_cull(nullptr, boxes, visible, 2), 0u);
+}
+
+// Drives the whole pipeline: submit a chunk, drain the finished mesh, check the
+// counters. This is the in-session loop the mod runs, exercised from C++.
+static void test_pipeline() {
+  GbrPipeline *p = gbr_pipeline_new(2, 32, 32);
+  CHECK(p != nullptr);
+  if (p == nullptr) {
+    return;
+  }
+
+  auto blocks = make_chunk(8, 8, 8);
+  std::memset(blocks.data(), 1, blocks.size());
+  CHECK_EQ(gbr_pipeline_submit(p, 42, blocks.data(), 8, 8, 8), 0);
+
+  std::vector<GbrMesh> meshes(16);
+  std::vector<std::uint64_t> ids(16, 0);
+  int n = 0;
+  for (int attempt = 0; attempt < 500 && n == 0; ++attempt) {
+    n = gbr_pipeline_drain(p, meshes.data(), ids.data(), 16);
+    if (n == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  }
+  CHECK_EQ(n, 1);
+  if (n == 1) {
+    CHECK_EQ(ids[0], std::uint64_t{42});
+    CHECK_EQ(meshes[0].vertex_count, std::size_t{24});
+    gbr_mesh_free(meshes[0]);
+  }
+
+  GbrPipelineStats stats{};
+  CHECK_EQ(gbr_pipeline_stats(p, &stats), 0);
+  CHECK_EQ(stats.submitted, std::uint64_t{1});
+  CHECK_EQ(stats.meshed, std::uint64_t{1});
+  CHECK_EQ(stats.drained, std::uint64_t{1});
+
+  gbr_pipeline_free(p);
+  gbr_pipeline_free(nullptr); // null is safe
+}
+
+// The client's world model: a footprint of block layers, meshed directly.
+static void test_world_layers() {
+  // bedrock(1) + 2 dirt(2) + 1 grass(3) over an 8x8 footprint -> 8x4x8 box.
+  const GbrBlockLayer layers[3] = {
+      {1, 1},
+      {2, 2},
+      {3, 1},
+  };
+  GbrMesh mesh = gbr_mesh_world_layers(layers, 3, 8, 8);
+  // Height 4 = bedrock(1) + dirt(2) + grass(1), so each of the four sides has
+  // three material bands (y=0, y=1-2, y=3): 4*3 = 12 side quads, plus the top
+  // and bottom = 14 quads = 56 vertices.
+  CHECK_EQ(mesh.vertex_count, std::size_t{56});
+  gbr_mesh_free(mesh);
+
+  GbrMesh empty = gbr_mesh_world_layers(nullptr, 0, 8, 8);
+  CHECK_EQ(empty.vertex_count, std::size_t{0});
+  gbr_mesh_free(empty);
 }
 
 int main() {
@@ -155,6 +215,8 @@ int main() {
   test_ring_round_trip();
   test_collision();
   test_frustum_cull();
+  test_pipeline();
+  test_world_layers();
 
   if (g_failures == 0) {
     std::printf("ffi_smoke: all checks passed\n");
