@@ -495,6 +495,125 @@ pub unsafe extern "C" fn gbr_offsets_version(
     n
 }
 
+/// One candidate's probe outcome, layout-compatible with the C++ mirror.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GbrProbeResult {
+    pub offset: u64,
+    pub level: u64,
+    pub manager: u64,
+    pub begin: u64,
+    pub end: u64,
+    /// Entity count when valid, -1 when rejected.
+    pub entities: i64,
+    /// The rejection code (0 when valid). See [`GbrProbeRejection`].
+    pub rejection: u32,
+}
+
+/// Rejection codes, mirrored by the C++ side.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GbrProbeRejection {
+    None = 0,
+    NoLevel = 1,
+    NoManager = 2,
+    NullBegin = 3,
+    Inverted = 4,
+    Misaligned = 5,
+    Ragged = 6,
+    TooLarge = 7,
+}
+
+impl From<crate::probe::CandidateRejection> for GbrProbeRejection {
+    fn from(value: crate::probe::CandidateRejection) -> Self {
+        use crate::probe::CandidateRejection as R;
+        match value {
+            R::NoLevel => Self::NoLevel,
+            R::NoManager => Self::NoManager,
+            R::NullBegin => Self::NullBegin,
+            R::Inverted => Self::Inverted,
+            R::Misaligned => Self::Misaligned,
+            R::Ragged => Self::Ragged,
+            R::TooLarge => Self::TooLarge,
+        }
+    }
+}
+
+/// Probes each candidate `Actor -> Level` offset against a live `actor` pointer
+/// and writes one [`GbrProbeResult`] per candidate into `out`.
+///
+/// Returns the single offset that validated, or 0 when none did or more than one
+/// did (ambiguous - the caller must not guess). All reads are fault-safe: an
+/// unreadable address is reported, never dereferenced.
+///
+/// # Safety
+/// `actor` is a live game pointer (or null); `offsets` must point to `count`
+/// u64s; `out` must have room for `capacity` results.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_probe_actor_level(
+    actor: *const u8,
+    level_manager_offset: u64,
+    offsets: *const u64,
+    count: u32,
+    out: *mut GbrProbeResult,
+    capacity: u32,
+) -> u64 {
+    if offsets.is_null() || out.is_null() || count == 0 || capacity == 0 {
+        return 0;
+    }
+    let offsets = std::slice::from_raw_parts(offsets, count as usize);
+    let results = crate::probe::probe_candidates(actor as usize, offsets, level_manager_offset);
+    let out = std::slice::from_raw_parts_mut(out, capacity as usize);
+    let n = results.len().min(out.len());
+    for (i, r) in results.iter().take(n).enumerate() {
+        out[i] = GbrProbeResult {
+            offset: r.offset,
+            level: r.level as u64,
+            manager: r.manager as u64,
+            begin: r.begin as u64,
+            end: r.end as u64,
+            entities: r.entities.map(|c| c as i64).unwrap_or(-1),
+            rejection: r
+                .rejection
+                .map(GbrProbeRejection::from)
+                .unwrap_or(GbrProbeRejection::None) as u32,
+        };
+    }
+    crate::probe::decide_offset(&results).unwrap_or(0)
+}
+
+/// Reads one named `entity_seam_offsets` field, or 0 when absent.
+///
+/// # Safety
+/// `map` must be valid and `name` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_offsets_entity_field(
+    map: *const GbrOffsetMap,
+    name: *const u8,
+    len: usize,
+) -> u64 {
+    if map.is_null() || name.is_null() {
+        return 0;
+    }
+    let bytes = std::slice::from_raw_parts(name, len);
+    let Ok(field) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    (*map).inner.entity_seam.get(field).copied().unwrap_or(0)
+}
+
+/// Reads one `usize` at `address` fault-safely.
+///
+/// Returns 0 when the read is refused. This is exposed so a C++ caller can probe
+/// a candidate without going through the whole chain.
+///
+/// # Safety
+/// `address` is read with `process_vm_readv`, which cannot fault.
+#[no_mangle]
+pub unsafe extern "C" fn gbr_probe_read_pointer(address: u64) -> u64 {
+    crate::probe::read_pointer(address as usize).unwrap_or(0) as u64
+}
+
 /// The core version, packed as `0x00MMmmpp`.
 #[no_mangle]
 pub extern "C" fn gbr_version() -> u32 {

@@ -137,6 +137,7 @@
   "actor_manager": {
     "constructor": 272310128,
     "level_entity_manager_offset": 992,
+    "actor_level_offset": 0,
     "vector_offset_in_manager": 8,
     "note": "Two-step walk: level + level_entity_manager_offset -> ActorManager*, then vector_offset_in_manager -> {begin, end, cap}."
   },
@@ -144,6 +145,11 @@
     "resolved": false,
     "reason": "The Actor position/rotation offsets are verified per build (see entity_seam_verification) and filled in below. The two that remain null - levelEntityListOffset and entityRuntimeIdOffset - are not recovered: they need a deeper disassembly pass, and a guessed value would fault the game thread. See docs/agent-notes/signature-derivation.md.",
     "fields": [
+      {
+        "name": "actorLevelOffset",
+        "meaning": "the Actor -> Level* member offset (local player to level)",
+        "offset": null
+      },
       {
         "name": "levelEntityListOffset",
         "meaning": "the Level/Dimension entity-list vector offset",

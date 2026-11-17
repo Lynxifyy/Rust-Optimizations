@@ -187,6 +187,46 @@ int gbr_entity_position(const struct GbrOffsetMap *map, const uint8_t *actor,
 // Returns the length written, excluding the NUL.
 size_t gbr_offsets_version(const struct GbrOffsetMap *map, uint8_t *out, size_t cap);
 
+// --- Fault-safe probing (deciding an offset against a live object) -----------
+
+// Rejection codes for a probed candidate. 0 means the candidate validated.
+enum {
+  GBR_PROBE_OK = 0,
+  GBR_PROBE_NO_LEVEL = 1,
+  GBR_PROBE_NO_MANAGER = 2,
+  GBR_PROBE_NULL_BEGIN = 3,
+  GBR_PROBE_INVERTED = 4,
+  GBR_PROBE_MISALIGNED = 5,
+  GBR_PROBE_RAGGED = 6,
+  GBR_PROBE_TOO_LARGE = 7,
+};
+
+// One candidate's probe outcome. Mirrors GbrProbeResult in src/ffi.rs.
+struct GbrProbeResult {
+  uint64_t offset;
+  uint64_t level;
+  uint64_t manager;
+  uint64_t begin;
+  uint64_t end;
+  int64_t entities;   // -1 when rejected
+  uint32_t rejection; // GBR_PROBE_* above
+};
+
+// Probes each candidate Actor->Level offset against a live `actor` pointer.
+// Writes one result per candidate into `out`. Returns the single offset that
+// validated, or 0 when none did or more than one did (ambiguous). Reads are
+// fault-safe: an unreadable address is reported, never dereferenced.
+uint64_t gbr_probe_actor_level(const uint8_t *actor, uint64_t level_manager_offset,
+                               const uint64_t *offsets, uint32_t count,
+                               struct GbrProbeResult *out, uint32_t capacity);
+
+// Reads one pointer at `address` fault-safely. Returns 0 when refused.
+uint64_t gbr_probe_read_pointer(uint64_t address);
+
+// Reads one named `entity_seam_offsets` field, or 0 when absent.
+uint64_t gbr_offsets_entity_field(const struct GbrOffsetMap *map,
+                                  const uint8_t *name, size_t len);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

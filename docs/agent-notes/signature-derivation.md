@@ -73,7 +73,23 @@ per build** and carry a value; two remain `null`.
 | `entityPositionOffset` | **verified = `0x230`** | member-address getter + float-vec3 group |
 | `entityRotationOffset` | **verified = `0x238`** | member-address getter + float-vec3 group |
 | `levelEntityListOffset` | **recovered** (`0x3e0` on 26.60/26.62, `0x3d8` on 26.52) | constructor store trace (see below) |
+| `actorLevelOffset` | **null** | not recovered - the walk's missing link (see below) |
 | `entityRuntimeIdOffset` | **null** | not recovered (needs a deeper pass) |
+
+The entity-list walk needs one more step before `Level`: from the local player
+(what `ClientInstance` slot 31 returns, an `Actor*`) to its `Level*`. That offset
+is **not recovered**, and the tool returns 0 rather than guess:
+
+- the `Actor` constructor stores its `Level&` argument (`x1`) at `Actor+0x20`,
+  while the `Mob` constructor stores `x1` at `Actor+0x1f0` - they conflict;
+- a displacement-only correlation (`[x,#off]` then `[.,+level_offset]`) is
+  unsound: `+0x20`/`+0x1f0` are common offsets on many types, and none of the
+  correlated sites uses the same base register with the known `Actor` position
+  field (`+0x230`), which is the check that would prove the base is an `Actor`.
+
+Recovering it needs a live-object confirmation or a `getLevel()`-style accessor
+resolved by name, not a static correlation. Until then the walker refuses (it
+requires `actorLevelOffset`) and the mod keeps the fallback.
 
 `levelEntityListOffset` is **not** a struct field on the `Level`; it is the offset
 of the `ActorManager*` member. The actor list is the `{begin, end, cap}` vector at

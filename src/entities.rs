@@ -1,17 +1,19 @@
-//! Walk the live entity list from a `Level*`, with the recovered offsets.
+//! Walk the live entity list, starting from the local player.
 //!
 //! This is the entity-list walk the `EntitySeamOffsets` map feeds. The recovered
-//! chain is two steps, which is why a single `ReadVectorRange(level, offset)` is
+//! chain is three steps, which is why a single `ReadVectorRange(level, offset)` is
 //! not enough:
 //!
 //! ```text
-//! level + level_entity_manager_offset  ->  ActorManager*
-//! ActorManager + vector_offset         ->  std::vector<Actor*> {begin, end, cap}
+//! LocalPlayer* (an Actor*)
+//!   + actor_level_offset          -> Level*
+//!   Level + level_entity_manager_offset -> ActorManager*
+//!   ActorManager + vector_offset  -> std::vector<Actor*> {begin, end, cap}
 //! ```
 //!
 //! Recovered values (verified per build; see `offsets/offsets_<version>.json`):
-//! `level_entity_manager_offset` is `0x3e0` on 26.60/26.62 and `0x3d8` on 26.52;
-//! `vector_offset` is `0x8` on all three.
+//! `actor_level_offset` is `0x20`; `level_entity_manager_offset` is `0x3e0` on
+//! 26.60/26.62 and `0x3d8` on 26.52; `vector_offset` is `0x8`.
 //!
 //! **Fail-closed, like the preloader's `EntityListWalk`.** Every step checks the
 //! pointer, the offset, the alignment and the span before touching memory, and a
@@ -22,7 +24,7 @@
 //! **The reads are volatile.** These addresses are the game's memory, written by
 //! the game's threads; a volatile read is what stops the compiler from folding or
 //! reordering them. The caller must still invoke this on the game thread, with a
-//! `Level*` the game just handed back - the same contract the preloader's
+//! `LocalPlayer*` the game just handed back - the same contract the preloader's
 //! local-player hook follows.
 
 use crate::offsets::OffsetMap;
@@ -37,6 +39,8 @@ pub const MAX_ENTITIES: usize = 65536;
 /// The offsets needed to walk the entity list, all recovered per build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntitySeam {
+    /// `Actor` -> `Level*` member offset.
+    pub actor_level_offset: u64,
     /// `Level` -> `ActorManager*` member offset.
     pub level_entity_manager_offset: u64,
     /// `ActorManager` -> `std::vector<Actor*>` member offset.
@@ -47,16 +51,15 @@ pub struct EntitySeam {
 
 impl EntitySeam {
     /// The seam from an offset map, or `None` when any piece is missing.
-    ///
-    /// `levelEntityListOffset` and `entityPositionOffset` come from the map;
-    /// `vector_offset_in_manager` is the recovered constant.
     pub fn from_map(map: &OffsetMap) -> Option<Self> {
+        let actor_level = *map.entity_seam.get("actorLevelOffset")?;
         let level = *map.entity_seam.get("levelEntityListOffset")?;
         let position = *map.entity_seam.get("entityPositionOffset")?;
-        if level == 0 || position == 0 {
+        if actor_level == 0 || level == 0 || position == 0 {
             return None;
         }
         Some(Self {
+            actor_level_offset: actor_level,
             level_entity_manager_offset: level,
             vector_offset_in_manager: VECTOR_OFFSET_IN_MANAGER,
             position_offset: position,
@@ -115,30 +118,39 @@ impl EntityRange {
     }
 }
 
-/// Walks `level + level_entity_manager_offset -> ActorManager + vector_offset`
-/// and returns the `{begin, end}` range, or `None` when any step is refused.
+/// Reads a pointer member at `base + offset`, or `None` when refused.
 ///
 /// # Safety
-/// `level` must be a live `Level*` the game returned (game thread). This reads
-/// game memory; it is the caller's job to guarantee the pointer is current.
-pub unsafe fn read_entity_range(level: *const u8, seam: &EntitySeam) -> Option<EntityRange> {
-    if level.is_null() || seam.level_entity_manager_offset == 0 {
+/// `base` must be a live game pointer (game thread).
+pub unsafe fn read_pointer_member(base: *const u8, offset: u64) -> Option<*const u8> {
+    if base.is_null() || offset == 0 || offset % 8 != 0 {
         return None;
     }
-    // The member offset must be 8-byte aligned to hold a pointer.
-    if seam.level_entity_manager_offset % 8 != 0 {
-        return None;
+    let slot = base.add(offset as usize) as *const usize;
+    let value = core::ptr::read_volatile(slot);
+    if value == 0 {
+        None
+    } else {
+        Some(value as *const u8)
     }
+}
 
-    let manager_slot = level.add(seam.level_entity_manager_offset as usize) as *const usize;
-    let manager = core::ptr::read_volatile(manager_slot) as *const u8;
-    if manager.is_null() {
-        return None;
-    }
+/// Walks `LocalPlayer -> Level -> ActorManager -> vector` and returns the
+/// `{begin, end}` range, or `None` when any step is refused.
+///
+/// # Safety
+/// `local_player` must be a live `LocalPlayer*` the game returned (game thread).
+/// This reads game memory; it is the caller's job to guarantee the pointer is
+/// current.
+pub unsafe fn read_entity_range(local_player: *const u8, seam: &EntitySeam) -> Option<EntityRange> {
+    // LocalPlayer (an Actor) -> Level*.
+    let level = read_pointer_member(local_player, seam.actor_level_offset)?;
+    // Level -> ActorManager*.
+    let manager = read_pointer_member(level, seam.level_entity_manager_offset)?;
+    // ActorManager -> vector {begin, end, cap}.
     if seam.vector_offset_in_manager % 8 != 0 {
         return None;
     }
-
     let vector = manager.add(seam.vector_offset_in_manager as usize) as *const usize;
     let begin = core::ptr::read_volatile(vector) as *const u8;
     let end = core::ptr::read_volatile(vector.add(1)) as *const u8;
@@ -180,6 +192,7 @@ pub unsafe fn read_entity_position(actor: *const u8, position_offset: u64) -> Op
 mod tests {
     use super::*;
 
+    const ACTOR_LEVEL_OFFSET: usize = 0x20;
     const LEVEL_MANAGER_OFFSET: usize = 0x3e0;
     const MANAGER_VECTOR_OFFSET: usize = 0x8;
     const POSITION_OFFSET: usize = 0x230;
@@ -198,6 +211,7 @@ mod tests {
         actors: Vec<Vec<u8>>,
         buf: Vec<u8>,
         count: usize,
+        level_off: usize,
     }
 
     impl Fixture {
@@ -218,6 +232,8 @@ mod tests {
                 })
                 .collect();
 
+            // The local player: an Actor whose +ACTOR_LEVEL_OFFSET points at the
+            // Level. It is the first "actor" buffer, so it also appears in the list.
             let level_off = 0usize;
             let manager_off = LEVEL_MANAGER_OFFSET + 8;
             let manager_size = MANAGER_VECTOR_OFFSET + 24;
@@ -227,33 +243,43 @@ mod tests {
             let mut buf = vec![0u8; total];
             let base = buf.as_ptr() as usize;
 
-            // The vector's {begin, end, cap}: a contiguous array of Actor*.
             let begin = base + pointers_off;
             let end = begin + count * 8;
             buf[vector_off..vector_off + 8].copy_from_slice(&begin.to_le_bytes());
             buf[vector_off + 8..vector_off + 16].copy_from_slice(&end.to_le_bytes());
             buf[vector_off + 16..vector_off + 24].copy_from_slice(&end.to_le_bytes());
 
-            // The pointer array: one Actor* per element.
             for (i, actor) in actors.iter().enumerate() {
                 let slot = pointers_off + i * 8;
                 buf[slot..slot + 8].copy_from_slice(&(actor.as_ptr() as usize).to_le_bytes());
             }
 
-            // The manager pointer, at level + LEVEL_MANAGER_OFFSET.
             let m = base + manager_off;
             buf[level_off + LEVEL_MANAGER_OFFSET..level_off + LEVEL_MANAGER_OFFSET + 8]
                 .copy_from_slice(&m.to_le_bytes());
 
-            Self { actors, buf, count }
+            Self {
+                actors,
+                buf,
+                count,
+                level_off,
+            }
         }
 
-        fn level(&self) -> *const u8 {
-            self.buf.as_ptr()
+        /// The local player: the first actor, with its Level pointer set.
+        fn local_player(&mut self) -> *const u8 {
+            let lp = self.actors[0].as_mut_ptr();
+            let level = self.buf.as_ptr() as usize + self.level_off;
+            unsafe {
+                let slot = lp.add(ACTOR_LEVEL_OFFSET) as *mut usize;
+                slot.write_unaligned(level);
+            }
+            lp as *const u8
         }
 
         fn seam(&self) -> EntitySeam {
             EntitySeam {
+                actor_level_offset: ACTOR_LEVEL_OFFSET as u64,
                 level_entity_manager_offset: LEVEL_MANAGER_OFFSET as u64,
                 vector_offset_in_manager: MANAGER_VECTOR_OFFSET as u64,
                 position_offset: POSITION_OFFSET as u64,
@@ -263,10 +289,10 @@ mod tests {
 
     #[test]
     fn walks_a_synthetic_entity_list() {
-        let fx = Fixture::new(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+        let mut fx = Fixture::new(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
         let seam = fx.seam();
         unsafe {
-            let range = read_entity_range(fx.level(), &seam).expect("range");
+            let range = read_entity_range(fx.local_player(), &seam).expect("range");
             assert_eq!(range.len(), 2);
             let a0 = range.actor_at(0).expect("actor 0");
             assert_eq!(
@@ -290,6 +316,7 @@ mod tests {
     #[test]
     fn null_level_is_refused() {
         let seam = EntitySeam {
+            actor_level_offset: ACTOR_LEVEL_OFFSET as u64,
             level_entity_manager_offset: LEVEL_MANAGER_OFFSET as u64,
             vector_offset_in_manager: MANAGER_VECTOR_OFFSET as u64,
             position_offset: POSITION_OFFSET as u64,
@@ -301,34 +328,38 @@ mod tests {
 
     #[test]
     fn zero_offset_is_refused() {
-        let fx = Fixture::new(&[[0.0, 0.0, 0.0]]);
+        let mut fx = Fixture::new(&[[0.0, 0.0, 0.0]]);
         let mut seam = fx.seam();
         seam.level_entity_manager_offset = 0;
+        let lp = fx.local_player();
         unsafe {
-            assert!(read_entity_range(fx.level(), &seam).is_none());
+            assert!(read_entity_range(lp, &seam).is_none());
         }
     }
 
     #[test]
     fn misaligned_offset_is_refused() {
-        let fx = Fixture::new(&[[0.0, 0.0, 0.0]]);
+        let mut fx = Fixture::new(&[[0.0, 0.0, 0.0]]);
         let mut seam = fx.seam();
-        seam.level_entity_manager_offset = 0x3e1;
+        seam.level_entity_manager_offset = 0x3e1; // not 8-aligned
+        let lp = fx.local_player();
         unsafe {
-            assert!(read_entity_range(fx.level(), &seam).is_none());
+            assert!(read_entity_range(lp, &seam).is_none());
         }
     }
 
     #[test]
     fn null_manager_is_refused() {
-        let level = vec![0u8; LEVEL_MANAGER_OFFSET + 8];
+        // A local player whose Level pointer is null -> refused at the first step.
+        let local_player = [0u8; ACTOR_LEVEL_OFFSET + 8];
         let seam = EntitySeam {
+            actor_level_offset: ACTOR_LEVEL_OFFSET as u64,
             level_entity_manager_offset: LEVEL_MANAGER_OFFSET as u64,
             vector_offset_in_manager: MANAGER_VECTOR_OFFSET as u64,
             position_offset: POSITION_OFFSET as u64,
         };
         unsafe {
-            assert!(read_entity_range(level.as_ptr(), &seam).is_none());
+            assert!(read_entity_range(local_player.as_ptr(), &seam).is_none());
         }
     }
 
@@ -373,10 +404,11 @@ mod tests {
 
     #[test]
     fn actor_at_out_of_range_is_none() {
-        let fx = Fixture::new(&[[0.0, 0.0, 0.0]]);
+        let mut fx = Fixture::new(&[[0.0, 0.0, 0.0]]);
         let seam = fx.seam();
+        let lp = fx.local_player();
         unsafe {
-            let range = read_entity_range(fx.level(), &seam).unwrap();
+            let range = read_entity_range(lp, &seam).unwrap();
             assert!(range.actor_at(range.len()).is_none());
         }
     }
@@ -384,11 +416,13 @@ mod tests {
     #[test]
     fn seam_from_map_requires_both_offsets() {
         let json = r#"{"version":"x","so_sha256":"a","entity_seam_offsets":{"fields":[
+            {"name":"actorLevelOffset","offset":32},
             {"name":"levelEntityListOffset","offset":992},
             {"name":"entityPositionOffset","offset":560}
         ]}}"#;
         let map = OffsetMap::parse(json).unwrap();
         let seam = EntitySeam::from_map(&map).expect("seam");
+        assert_eq!(seam.actor_level_offset, 32);
         assert_eq!(seam.level_entity_manager_offset, 992);
         assert_eq!(seam.position_offset, 560);
         assert_eq!(seam.vector_offset_in_manager, 8);

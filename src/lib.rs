@@ -13,6 +13,7 @@
 //! - [`parallel`] - a bounded scoped worker pool for off-thread meshing.
 //! - [`pipeline`] - the ring + worker work loop (submit -> mesh -> drain).
 //! - [`world`]    - a layered world description turned into a meshed volume.
+//! - [`probe`]  - fault-safe memory probing for deciding an offset live.
 //! - [`ring`]   - a bounded lock-free multi-producer/multi-consumer ring buffer.
 //! - [`ffi`]    - the C ABI the C++ shim links against.
 
@@ -23,6 +24,7 @@ pub mod mesher;
 pub mod offsets;
 pub mod parallel;
 pub mod pipeline;
+pub mod probe;
 pub mod ring;
 pub mod world;
 
